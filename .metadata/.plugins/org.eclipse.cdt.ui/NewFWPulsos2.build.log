@@ -1,0 +1,23 @@
+12:17:07 **** Incremental Build of configuration Debug for project NewFWPulsos2 ****
+make -j12 all 
+arm-none-eabi-g++ "../Core/SM_Class/Statemachine_senales.cpp" -mcpu=cortex-m3 -std=gnu++14 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F103xB -c -I../Core/Inc -I../Drivers/STM32F1xx_HAL_Driver/Inc -I../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32F1xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti -fno-use-cxa-atexit -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/SM_Class/Statemachine_senales.d" -MT"Core/SM_Class/Statemachine_senales.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Core/SM_Class/Statemachine_senales.o"
+arm-none-eabi-g++ -o "NewFWPulsos2.elf" @"objects.list"   -mcpu=cortex-m3 -T"C:\Users\Saul Luna\Documents\Promos\New Pulsos 2.20 FW\NewFWPulsos2\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="NewFWPulsos2.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -lstdc++ -lsupc++ -Wl,--end-group
+Finished building target: NewFWPulsos2.elf
+ 
+arm-none-eabi-size  NewFWPulsos2.elf 
+arm-none-eabi-objdump -h -S NewFWPulsos2.elf  > "NewFWPulsos2.list"
+   text	   data	    bss	    dec	    hex	filename
+  58628	   5080	   3616	  67324	  106fc	NewFWPulsos2.elf
+arm-none-eabi-objcopy  -O ihex NewFWPulsos2.elf  "NewFWPulsos2.hex"
+Finished building: default.size.stdout
+arm-none-eabi-objcopy  -O binary NewFWPulsos2.elf  "NewFWPulsos2.bin"
+ 
+Finished building: NewFWPulsos2.hex
+Finished building: NewFWPulsos2.bin
+ 
+ 
+Finished building: NewFWPulsos2.list
+ 
+
+12:17:09 Build Finished. 0 errors, 0 warnings. (took 1s.864ms)
+

@@ -1,0 +1,9 @@
+../Core/Src/GeneradorPulsos.h:117:17:void GeneradorPulsos::_setHigh()	2
+../Core/Src/GeneradorPulsos.h:122:17:void GeneradorPulsos::_setLow()	2
+../Core/Src/GeneradorPulsos.cpp:26:18:static GeneradorPulsos* GeneradorPulsos::getInstance()	4
+../Core/Src/GeneradorPulsos.cpp:34:6:static void GeneradorPulsos::destroyInstance()	1
+../Core/Src/GeneradorPulsos.cpp:43:1:GeneradorPulsos::GeneradorPulsos()	1
+../Core/Src/GeneradorPulsos.cpp:56:6:void GeneradorPulsos::init(GPIO_TypeDef*, uint16_t)	1
+../Core/Src/GeneradorPulsos.cpp:72:6:void GeneradorPulsos::addPulses(uint32_t)	4
+../Core/Src/GeneradorPulsos.cpp:90:6:void GeneradorPulsos::update()	9
+../Core/Src/GeneradorPulsos.cpp:136:6:void GeneradorPulsos::_startNextPulse()	1

@@ -1,0 +1,217 @@
+/*
+ * Statemachine_senales.cpp
+ *
+ *  Created on: Sep 1, 2026
+ *      Author: Saul Luna
+ */
+
+
+
+/*
+ * StateMachine_Senales.cpp
+ *
+ * Manejo de la estructura Signal: inicialización, lectura de contadores
+ * desde memoria I2C y procesamiento de pulsos de entrada.
+ * Separado de StateMachine.cpp — la declaración completa de la clase sigue
+ * en StateMachine.h.
+ *
+ */
+
+#include "../SM_Class/StateMachine.h"
+#include "../Src/GeneradorPulsos.h"
+
+void StateMachine::InitMeters(volatile Flags &Obj_Flags) {
+    // Leer datos desde memoria I2C
+    HAL_I2C_Mem_Read(hi2c2, data->DIRECCION_I2C_MEM, data->Word_address,I2C_MEMADD_SIZE_16BIT, data->flash_data, 64, -1);
+
+    // Tabla de descriptores
+    struct MeterDescriptor {
+        uint8_t* array;
+        int*     prog;
+        int*     instant;
+        int      flashOffset;
+    };
+
+    MeterDescriptor meters[5] = {
+        { data->Total_In_Meter_prg_A,  &data->Total_In_Meter_prg,  &data->Total_In_Meter,  5  },
+        { data->Total_BET_meter_prg_A, &data->Total_BET_meter_prg, &data->Total_BET_meter, 10 },
+        { data->HopperMeter_prg_A,     &data->HopperMeter_prg,     &data->HopperMeter,     15 },
+        { data->Refill_prg_A,          &data->Refill_prg,          &data->Refill,          20 },
+        { data->HandPayMeter_prg_A,    &data->HandPayMeter_prg,    &data->HandPayMeter,    25 }
+    };
+
+    // Inicializar arrays, valores progresivos e instantáneos
+    for (auto& m : meters) {
+        for (int pos = 0; pos < 5; pos++) {
+            m.array[pos] = data->flash_data[pos + m.flashOffset];
+        }
+        *m.prog    = BCDArrayToDecimal(m.array, 5);
+        *m.instant = *m.prog;
+    }
+
+
+    // Reset de flags si corresponde
+    if (Obj_Flags.Flag_Total_In_Meter &
+        Obj_Flags.Flag_Total_BET_meter &
+        Obj_Flags.Flag_HopperMeter)
+    {
+        Obj_Flags.Flag_Botton_CashOut   = 0;
+        Obj_Flags.Flag_Total_In_Meter   = 0;
+        Obj_Flags.Flag_Total_BET_meter  = 0;
+        Obj_Flags.Flag_HopperMeter      = 0;
+    }
+
+
+    done = 0;
+}
+
+
+void StateMachine::InitSignals(volatile Flags& flags)
+{
+    sig1 = Signal(
+        &flags.Flag_Total_In_Meter,
+        Total_In_Meter_GPIO_Port, Total_In_Meter_Pin,
+       &data->Total_In_Meter,
+        &data->Total_In_Meter_prg,
+        data->Total_In_Meter_prg_A,
+        &data->timer_val1,
+        &data->Evento_CashIn,
+		(char*)data->json_progre,
+        5,
+        &data->Valor_Actual1,
+        TIM_350ms, TIM_500ms,
+        EventoTipo::Contador1
+    );
+
+    sig2 = Signal(
+        &flags.Flag_Total_BET_meter,
+        TotalBETmeter_GPIO_Port, TotalBETmeter_Pin,
+        &data->Total_BET_meter,
+        &data->Total_BET_meter_prg,
+        data->Total_BET_meter_prg_A,
+        &data->timer_val2,
+        &data->Evento_BET,
+		(char*)data->json_progre,
+        10,
+        &data->Valor_Actual2,
+		TIM_350ms, TIM_500ms,
+        EventoTipo::Contador2
+    );
+
+    sig3 = Signal(
+        &flags.Flag_HopperMeter,
+        HopperMeter_GPIO_Port, HopperMeter_Pin,
+        &data->HopperMeter,
+        &data->HopperMeter_prg,
+        data->HopperMeter_prg_A,
+        &data->timer_val3,
+        &data->Evento_CashOut,
+		(char*)data->json_progre,
+        15,
+        &data->Valor_Actual3,
+		TIM_1s, TIM_2s,
+        EventoTipo::Contador3
+    );
+
+ /*   Diagnostico_Parametros = Varibles_Diagnostico(
+
+    );
+
+    vsrc_mv = mv_real;     // 2700 mV
+   	 vmcu_mv = mv_equiv;    // 10800 mV
+   	 */
+}
+
+
+void  StateMachine::ProcessSignal( Signal& sig, EventoTipo tipo_evt)
+{
+    // ========= Pulso =========
+    if (*sig.flag &&
+        HAL_GPIO_ReadPin(sig.gpio_port, sig.gpio_pin) == GPIO_PIN_RESET)
+    {
+        (*sig.counter)++;
+        *sig.timer_val = __HAL_TIM_GET_COUNTER(_htim4);
+
+        if (!(*sig.evento_activo)) {
+        	 data->Contador_datos_enviados++;
+
+        	 datosJson = CrearJsonData(tipo_evt, "str");
+        	 CrearJson_obj->ConstruirJson(datosJson, data->json_progre);
+        	 Envio_datos_JSON();
+            *sig.evento_activo = 1;
+            if (_hiwdg != nullptr)  HAL_IWDG_Refresh(_hiwdg);
+        }
+        *sig.flag = false;
+    }
+
+    // ========= Timeout =========
+    if (*sig.evento_activo) {
+        uint32_t now = __HAL_TIM_GET_COUNTER(_htim4);
+        uint32_t dt = (now > *sig.timer_val) ? (now - *sig.timer_val)
+                                            : (*sig.timer_val - now);
+
+      if (dt >= sig.TimeOutMin && dt < sig.TimeOutMax) {
+
+            *sig.valor_actual = 0;
+
+            // Leer flash
+            HAL_I2C_Mem_Read(hi2c2, data->DIRECCION_I2C_MEM,
+                             data->Word_address, I2C_MEMADD_SIZE_16BIT,
+                             data->flash_data, 64, -1);
+
+            // Extraer BCD
+            for (int i = 0; i < 5; i++)
+                sig.contador_prg_A[i] = data->flash_data[sig.flash_offset + i];
+
+            *sig.contador_prg = BCDArrayToDecimal(sig.contador_prg_A, 5);
+
+            if (*sig.counter > *sig.contador_prg) {
+                *sig.valor_actual = *sig.counter - *sig.contador_prg;
+                *sig.contador_prg += *sig.valor_actual;
+                intToBCDArray(*sig.contador_prg, sig.contador_prg_A);
+
+                for (int i = 0; i < 5; i++)
+                    data->flash_data[sig.flash_offset + i] = sig.contador_prg_A[i];
+            }
+
+            HAL_I2C_Mem_Write(hi2c2, data->DIRECCION_I2C_MEM,
+                              data->Word_address, I2C_MEMADD_SIZE_16BIT,
+                              data->flash_data, 64, -1);
+
+            // JSON END
+            data->Contador_datos_enviados++;
+			// Preparar datos finales
+
+			datosJson = CrearJsonData(tipo_evt, "end");
+
+			// Enviar JSON final
+			CrearJson_obj->ConstruirJson(datosJson, data->json_progre);
+			Envio_datos_JSON();
+
+            // JSON Instantáneo (BET / CASHOUT)
+            if ((sig.evt == EventoTipo::Contador2 || sig.evt == EventoTipo::Contador3)
+                && *sig.valor_actual > 0)
+            {
+            	 // Enviar JSON instantáneo
+				data->Valor_Actual = *(sig.valor_actual);
+				data->Contador_datos_enviados++;
+				datosJson.sec = data->Contador_datos_enviados;
+				CrearJson_obj->JSON_Evento_INSTANTANEO(datosJson, data->Valor_Actual, data->json_progre );
+				Envio_datos_JSON();
+            }
+
+            *sig.evento_activo = 0;
+        }
+    }
+}
+
+
+void StateMachine::procesarTodasLasSignales() {
+    ProcessSignal(sig1, EventoTipo::CashIn);
+    ProcessSignal(sig2, EventoTipo::Bet);
+    ProcessSignal(sig3, EventoTipo::CashOut);
+    GeneradorPulsos::getInstance()->update();
+
+          sas->poleoSimple_SAS();
+
+}

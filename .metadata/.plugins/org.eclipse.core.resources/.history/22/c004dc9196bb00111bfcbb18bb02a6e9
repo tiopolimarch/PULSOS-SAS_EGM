@@ -1,0 +1,91 @@
+/*
+ * SasReceiver.h
+ * Adaptado para STM32F103 (Placa RUTA) - Protocolo SAS 9-bits DMA
+ */
+
+#ifndef MISLIBS_PERIPHERALS_SERIALSAS_SASRECEIVER_H_
+#define MISLIBS_PERIPHERALS_SERIALSAS_SASRECEIVER_H_
+
+#include "stm32f1xx_hal.h" // <--- Cambiado a HAL de la familia F1
+#include <stdint.h>
+
+class SasReceiver
+{
+public:
+    // 256 half-words = 512 bytes de buffer DMA = 133 ms de aire a 19200 baudios.
+    static constexpr uint16_t RX_DMA_WORDS = 256;
+
+    // Trama SAS más larga (long poll con muchos medidores) + margen.
+    static constexpr uint16_t MAX_TRAMA = 260;
+
+    // Cuántas tramas completas pueden esperar en cola.
+    static constexpr uint8_t COLA_TRAMAS = 8;
+
+    static constexpr uint16_t TX_MAX = 256;
+
+    // Si un mensaje queda a medias más de esto, se descarta.
+    static constexpr uint32_t TIMEOUT_TRAMA_MS = 50;
+
+    void begin(UART_HandleTypeDef* huart, uint8_t direccionEgm = 0x01);
+
+    // Llamar desde las ISR (callbacks de HAL)
+    void onRxEvent(uint16_t size);
+    void onTxComplete();
+    void onError();
+
+    // Llamar desde el main loop
+    void service();
+    uint16_t readFrame(uint8_t* destino, uint16_t maxLen, uint32_t* edadMs = nullptr);
+    bool write(const uint8_t* datos, uint16_t largo);
+
+    bool txBusy() const { return txBusy_; }
+
+    // Diagnóstico
+    uint32_t tramasRecibidas() const { return statTramas_; }
+    uint32_t tramasPerdidas()  const { return statColaLlena_; }
+    uint32_t txRechazados()    const { return statTxOcupado_; }
+    uint32_t erroresUart()     const { return statErrores_; }
+    uint32_t tramasIncompletas() const { return statIncompletas_; }
+
+    uint32_t bytesConWakeup()  const { return statWakeup1_; }
+    uint32_t bytesSinWakeup()  const { return statWakeup0_; }
+
+private:
+    void     armarRx();
+    void     publicarTrama();
+    uint16_t largoEsperado() const;
+
+    UART_HandleTypeDef* huart_ = nullptr;
+    uint8_t  direccionEgm_ = 0x01;
+
+    uint16_t dmaRx_[RX_DMA_WORDS] = {};
+    uint16_t dmaTail_ = 0;
+
+    uint8_t  ensamble_[MAX_TRAMA] = {};
+    uint16_t ensambleLen_ = 0;
+    volatile uint32_t ensambleTick_ = 0;
+
+    uint8_t  cola_[COLA_TRAMAS][MAX_TRAMA] = {};
+    uint16_t colaLen_[COLA_TRAMAS]  = {};
+    uint32_t colaTick_[COLA_TRAMAS] = {};
+    volatile uint8_t colaHead_ = 0;
+    volatile uint8_t colaTail_ = 0;
+
+    volatile bool rearmarRx_ = false;
+
+    uint16_t txBuf_[TX_MAX] = {};
+    volatile bool txBusy_ = false;
+
+    volatile uint32_t statTramas_      = 0;
+    volatile uint32_t statColaLlena_   = 0;
+    volatile uint32_t statTxOcupado_   = 0;
+    volatile uint32_t statErrores_     = 0;
+    volatile uint32_t statIncompletas_ = 0;
+    volatile uint32_t statWakeup1_     = 0;
+    volatile uint32_t statWakeup0_     = 0;
+
+    static constexpr uint16_t BIT_WAKEUP   = 0x0100;
+    static constexpr uint16_t MASCARA_DATO = 0x00FF;
+};
+
+#endif /* MISLIBS_PERIPHERALS_SERIALSAS_SASRECEIVER_H_ */

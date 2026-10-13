@@ -1,0 +1,508 @@
+/*
+ * Statemachine_estados.cpp
+ *
+ *  Created on: Sep 1, 2026
+ *      Author: Saul Luna
+ */
+
+
+
+/*
+ * StateMachine_Estados.cpp
+ *
+ * Manejadores de cada estado del switch principal (enum State) y de la
+ * sub-máquina de Cash Out (enum CashOutState).
+ * Separado de StateMachine.cpp — la declaración completa de la clase sigue
+ * en StateMachine.h.
+ *
+ */
+
+#include "../SM_Class/StateMachine.h"
+#include "../Src/GeneradorPulsos.h"
+
+
+
+State StateMachine::ProcesarJsonRecibido( uint8_t* json_buffer) {
+    int status = CrearJson_obj->Recibe_JSON(json_buffer);
+    switch (status) {
+        case Cadena_NO_valida:
+            // Serial->Println("Cadena no valida");
+        	memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+		    buffer = 0;
+            return State::Estado_Recepcion_Json;
+
+        case Reset_Meters:
+        	 data->Evento_Reset = 1;
+        	 memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+			 buffer = 0;
+             return State::Estado_Reset_Meters_JSON;
+
+/*
+        case Test_Salida:
+			data.Testeo_Salida = 1;
+			CrearJson_obj.Obtener_S1(json_buffer, &data.Pulsos_S1);
+			 memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+			 buffer = 0;
+			 Serial->Println("Probando salidas");
+			return State::Recepcion_Json;
+*/
+
+        case WEMOS_listo:
+        	memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+		    buffer = 0;
+            return State::Estado_Recepcion_Json;
+
+        case Solicitud_de_Estado:
+        	memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+			buffer = 0;
+			return State::Estado_Solicitud_de_Estado_Contadores;
+
+        case Solicitud_de_FW:
+        	memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+			buffer = 0;
+        	return State::Estado_Solicitud_de_Version;
+
+        case Diagnostico:
+        	memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+			buffer = 0;
+			return State::Estado_Diagnostico_STM32;
+
+
+        case Solicitud_Cash_Out:
+        	  memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+			  buffer = 0;
+			 return State::Proceso_Cash_Out;
+
+        case Solicitud_Cash_In:
+        	if( CrearJson_obj->Decodifica_Solicitud_Cash_In( JSON_datos_recibidos, Creditos, TiempoPulso_In)){
+          	 memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+  			 buffer = 0;
+  			 return State::Proceso_Cash_In;
+        	}else{
+        		 memset(JSON_datos_recibidos,0,sizeof(JSON_datos_recibidos));
+				 buffer = 0;
+				 return State::Estado_Recepcion_Json;
+        	}
+
+
+        default:
+            return State::Estado_Recepcion_Json;
+    }
+}
+
+
+// Implementación de handleInicio
+State StateMachine::handleInicio(volatile Flags &Obj_Flags) {
+	 if (!flag_DELAY_INICIO)
+		 {
+			 tickInicio = HAL_GetTick();   // Guarda el tiempo inicial
+			 if (_hiwdg != nullptr)  HAL_IWDG_Refresh(_hiwdg);
+			 flag_DELAY_INICIO = true;
+			// Serial->Println("{\"egm\":1000,\"evt\":\"ever\",\"sta\":\"end\",\"ver\":\"5.06\"}");
+		 }
+
+	  if  (HAL_GetTick() - tickInicio >= DELAY_INICIO_MS)
+		{
+	    // Aquí ya pasó el delay de 500 ms, señales estabilizadas
+			 flag_DELAY_INICIO = false;
+
+	    Serial->init(huart_Serial);
+
+        // Inicializar metros
+        InitMeters(Obj_Flags);
+
+
+        // Iniciar periféricos
+        IniciarTimer();
+
+        // Obtener causa de reset
+        g_reset_cause = Obtener_Causa_Reset();
+
+        // Limpiar flags
+        limpiarFlags(Obj_Flags);
+
+        // Inicializar señales
+        InitSignals(Obj_Flags);
+
+        //Inicia Generación de pulsos (CASH IN REMOTO)
+        GeneradorPulsos::getInstance()->init(GPIOA, Coin_IN_Pin);
+
+        sas->begin(huart_Serial_SAS);
+
+        sas->vincularContadores((uint32_t*)data->Total_In_Meter_prg,
+        		                (uint32_t*)data->Total_BET_meter ,
+								(uint32_t*)data->HopperMeter_prg, 0);
+
+
+        //Serial->Println("Inicio OK");
+        // Transición al siguiente estado
+        return State::Estado_Recepcion_Json;
+    }
+
+    // Permanecer en el mismo estado
+    return State::Estado_Inicio;
+}
+
+
+// Implementación de handleRecepcionJson
+State StateMachine::handleRecepcionJson() {
+    // Intentar leer mensaje serial
+	 if (LeerMensajeSerial( JSON_datos_recibidos, sizeof(JSON_datos_recibidos))) {
+		 currentState = ProcesarJsonRecibido(JSON_datos_recibidos);
+		 memset(JSON_datos_recibidos, 0, sizeof(JSON_datos_recibidos));
+		 return currentState;
+	 }
+
+    // Manejar timers
+	// Serial->Println("Manejar timers");
+    handleTimers();
+
+    // Procesar señales
+    procesarTodasLasSignales();
+
+    // Revisar sino ha caido el voltaje
+
+    return State::Caida_de_Voltaje;
+   // return State::Estado_Recepcion_Json;
+
+}
+
+
+State StateMachine::ResetContadores()
+{
+	memset(data->flash_data,0,sizeof(data->flash_data));
+	 HAL_I2C_Mem_Write(hi2c2, data->DIRECCION_I2C_MEM, data->Word_address, I2C_MEMADD_SIZE_16BIT, data->flash_data, 64, -1);
+
+	 // --- Actualizar contadores progresivos desde flash_data ---
+	 struct ContadorMap {
+		 int* contador;
+		 uint8_t* arreglo_A;
+		 int offset;
+	 };
+
+	 // Mapear los offsets a los contadores y arreglos
+	 ContadorMap mapas[] = {
+		 { &data->Total_In_Meter_prg, data->Total_In_Meter_prg_A, 5 },
+		 { &data->Total_BET_meter_prg, data->Total_BET_meter_prg_A, 10 },
+		 { &data->HopperMeter_prg, data->HopperMeter_prg_A, 15 }
+	 };
+
+	 for (auto &map : mapas) {
+		 // Reconstruir el valor del contador desde flash_data
+		 int valor = 0;
+		 for(int pos = 0; pos < 5; pos++) {
+			 valor = (valor << 8) | data->flash_data[pos + map.offset];  // Suponiendo que flash_data guarda BCD simple
+		 }
+
+		 // Actualizar el contador y el arreglo BCD
+		 *(map.contador) = valor;
+		 intToBCDArray(*(map.contador), map.arreglo_A);
+
+		 // Guardar el arreglo BCD nuevamente en flash_data (opcional)
+		 for(int pos = 0; pos < 5; pos++) {
+			 data->flash_data[pos + map.offset] = map.arreglo_A[pos];
+		 }
+	 }
+		   data->Contador_datos_enviados++;
+
+	//	   Serial->Println("Reset de contadores OK corregir JSON");
+		   // Preparar datos finales
+
+			datosJson = CrearJsonData(EventoTipo::RamClear , "end" );
+			// Enviar JSON final
+
+		   CrearJson_obj->ConstruirJson(datosJson, data->json_progre);
+		   Envio_datos_JSON();
+		   data->Total_In_Meter = data->Total_In_Meter_prg;
+		   data->Total_BET_meter = data->Total_BET_meter_prg;
+		   data->HopperMeter = data->HopperMeter_prg;
+		   data->Refill = data->Refill_prg;
+		   data->HandPayMeter = data->HandPayMeter_prg;
+		   data->Evento_Reset = 0;
+
+
+return State::Estado_Recepcion_Json;
+}
+
+
+State StateMachine::SolicitudFirmware()
+{
+	data->Contador_datos_enviados++;
+	datosJson = CrearJsonData(EventoTipo::VersionFW , "end" );
+	CrearJson_obj->ConstruirJson(datosJson, data->json_progre );
+	Envio_datos_JSON();
+   return State::Estado_Recepcion_Json;
+}
+
+
+State StateMachine::Estado_Contadores(){
+	data->Contador_datos_enviados++;
+    datosJson = CrearJsonData(EventoTipo::EdoContadores , "end" );
+    CrearJson_obj->ConstruirJson(datosJson, data->json_progre );
+    Envio_datos_JSON();
+	return State::Estado_Recepcion_Json;
+}
+
+
+State StateMachine::Diagnostico_STM32(){
+
+	 decimal_test++;
+	 intToBCDArray(decimal_test, mem_test_pattern);
+
+	 HAL_I2C_Mem_Write(
+	            hi2c2,
+				data->DIRECCION_I2C_MEM,
+				data->Word_address + MEM_TEST_OFFSET,
+	            I2C_MEMADD_SIZE_16BIT,
+	            mem_test_pattern,
+	            MEM_TEST_SIZE,
+	            HAL_MAX_DELAY);
+
+
+	 if (HAL_ADC_PollForConversion(hadc1, HAL_MAX_DELAY) == HAL_OK) {
+
+
+		 adc_value = HAL_ADC_GetValue(hadc1); // Obtiene el valor del ADC
+		 mv_real = (adc_value * 3300UL) / 4095UL;
+		 mv_equiv = (mv_real * 12000UL) / 3300UL;
+
+		 data->vsrc_mv = mv_real;
+		 data->vmcu_mv = mv_equiv;
+
+
+
+	 }
+
+
+
+	 HAL_Delay(10);
+
+
+	 HAL_I2C_Mem_Read(
+	            hi2c2,
+				data->DIRECCION_I2C_MEM,
+				data->Word_address + MEM_TEST_OFFSET,
+				I2C_MEMADD_SIZE_16BIT,
+	            mem_test_read,
+	            MEM_TEST_SIZE,
+	            HAL_MAX_DELAY);
+
+	 int decimal_test_Comparacion  = BCDArrayToDecimal(mem_test_read, 5);
+	 data->Status_memoria = (decimal_test == decimal_test_Comparacion) ? "OK" : "ERROR";
+
+
+	 data->temp_mcu_x10 = Leer_Temperatura_MCU_x10();
+
+	// Serial->Println("Temp MCU: %ld.%ld C", data.temp_mcu_x10 / 10, abs(data.temp_mcu_x10 % 10));
+
+	 data->Causas_Reset = ResetCause_ToString(g_reset_cause);
+
+	 data->Contador_datos_enviados++;
+	 datosJson = CrearJsonData(EventoTipo::Diagnostico_STM , "end");
+	 CrearJson_obj->ConstruirJson(datosJson, data->json_progre);
+     Envio_datos_JSON();
+
+
+
+	return State::Estado_Recepcion_Json;
+}
+
+
+State StateMachine::CashOut_Proceso()
+{
+	handleTimers();
+    //  Siempre monitoreamos señales
+	procesarTodasLasSignales();
+
+	 //  Siempre actualizamos pulso (regresa la línea a ALTO tras TIM_80ms)
+
+
+	    switch (State_Cash_Out)
+	     {
+	         // ── Init: activa línea, lanza primer pulso, envía JSON "str" ─────
+	         case CashOutState::Init:
+	         {
+	           //  Serial->Println("Cash Init");
+
+	             // Activar línea de habilitación del hopper
+	             HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
+	             Hopper_Valor_Anterior = data->HopperMeter;
+	             Star_Time  = HAL_GetTick();
+	             State_Cash_Out = CashOutState::Waitfirtspulse;
+	             break;
+	         }
+
+
+	         case CashOutState::Waitfirtspulse:
+	         {
+	        	 if ((HAL_GetTick() - Star_Time) >= 200UL){
+	        		 Star_Time  = HAL_GetTick();
+					 pulse->start();
+					 State_Cash_Out = CashOutState::SendingPulses;
+					 }
+					 else{
+						 State_Cash_Out = CashOutState::Waitfirtspulse;
+					 }
+	        	 break;
+	         }
+
+	         // ── WaitEGMResponse: espera respuesta de la EGM ──────────────────
+	         // Si la EGM responde (Evento_CashOut == 1) → continuar enviando pulsos.
+	         // Si se agota el timeout configurable (CASHOUT_RESPONSE_TIMEOUT) sin
+	         // respuesta → ir a VerifyEnd para comprobar si se dispensó algo.
+	         case CashOutState::SendingPulses:
+	         {
+
+	        	 if ((HAL_GetTick() - Star_Time) >= 2000UL){
+					 // Sin respuesta en el tiempo configurado → verificar contadores
+
+					 //Serial->Println("WaitPulseAck timeout - cho sin cambio: %d",data.HopperMeter);
+
+					 pulse->stop();
+					// State_Cash_Out = CashOutState::VerifyEnd;
+					 State_Cash_Out = CashOutState::Finish;
+					 }
+					 else{
+						 State_Cash_Out = CashOutState::SendingPulses;
+					 }
+
+	        	 if (_hiwdg != nullptr)  HAL_IWDG_Refresh(_hiwdg);
+
+	             break;
+	         }
+
+
+	         case CashOutState::Finish:
+	         {
+
+	             HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
+
+	            // HAL_GPIO_WritePin(hopperPulse.port, hopperPulse.pin, GPIO_PIN_SET);
+	             State_Cash_Out = CashOutState::Init;
+			    return State::Estado_Recepcion_Json;
+			    break;
+	         }
+
+
+	         default:
+	         {
+
+	             break;
+	         }
+	     }
+
+    return State::Proceso_Cash_Out;
+}
+
+
+State StateMachine::CashIn_Proceso(){
+
+	GeneradorPulsos::getInstance()->addPulses((uint32_t)Creditos);
+	    Creditos = 0;
+
+	return State::Estado_Recepcion_Json;
+}
+
+
+State StateMachine::CallbackCaida_Voltaje(){
+	if (HAL_ADC_PollForConversion(hadc1, HAL_MAX_DELAY) == HAL_OK) {
+	//	  		 if(!HAL_GPIO_ReadPin(VIN_MONITOR2_GPIO_Port, VIN_MONITOR2_Pin)){
+
+								  adc_value = HAL_ADC_GetValue(hadc1); // Obtiene el valor del ADC
+
+			 if (adc_value  <  3500){
+							if (!done){
+
+								HAL_GPIO_WritePin(GPIOA, Output4_Pin, GPIO_PIN_RESET);
+								HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
+								//Serial->Println("Caida de voltaje detectada, guardando contadores" );
+
+								// Leer datos desde memoria I2C
+							    HAL_I2C_Mem_Read(hi2c2, data->DIRECCION_I2C_MEM, data->Word_address,I2C_MEMADD_SIZE_16BIT, data->flash_data, 64, -1);
+
+							    // Tabla de descriptores
+							    struct MeterDescriptor {
+							        uint8_t* array;
+							        int*     prog;
+							        int      flashOffset;
+							    };
+
+							    MeterDescriptor meters[5] = {
+							        { data->Total_In_Meter_prg_A,  &data->Total_In_Meter_prg,   5  },
+							        { data->Total_BET_meter_prg_A, &data->Total_BET_meter_prg,  10 },
+							        { data->HopperMeter_prg_A,     &data->HopperMeter_prg,      15 },
+							        { data->Refill_prg_A,          &data->Refill_prg,           20 },
+							        { data->HandPayMeter_prg_A,    &data->HandPayMeter_prg,     25 }
+							    };
+
+							    // Inicializar arrays, valores progresivos e instantáneos
+							    for (auto& m : meters) {
+							        for (int pos = 0; pos < 5; pos++) {
+							            m.array[pos] = data->flash_data[pos + m.flashOffset];
+							        }
+							        *m.prog    = BCDArrayToDecimal(m.array, 5);
+							    }
+
+
+									//		  Numero_Apagado_EGM =  BCDToDecimal(Numero_Apagado_EGM_A, 5);
+									//		  Numero_Apagado_EGM++;
+
+							  //  Serial->Println("Los valores instaneos: CHI %d, CHO %d", data.Total_In_Meter, data.HopperMeter );
+
+											  if( data->Total_In_Meter > data->Total_In_Meter_prg)  {
+												  data->Total_In_Meter = data->Total_In_Meter - data->Total_In_Meter_prg;
+												//Valor_Actual1 = Total_In_Meter - Total_In_Meter_prg;;
+											  }  else{
+												  data->Total_In_Meter = 0;
+											  }
+
+
+											  if(data->Total_BET_meter > data->Total_BET_meter_prg){
+												  data->Total_BET_meter = data->Total_BET_meter - data->Total_BET_meter_prg;
+												//Valor_Actual2 = Valor_Actual2 + 2;
+											  }else{
+												  data->Total_BET_meter = 0;
+											  }
+
+
+											  if (data->HopperMeter > data->HopperMeter_prg)
+											  {
+												  data->HopperMeter = data->HopperMeter - data->HopperMeter_prg;
+											  }else{
+												  data->HopperMeter = 0;
+											  }
+
+
+
+											  if (Flag_pago_pendiente == true)
+												  Pago_pendiente += data->HopperMeter;
+
+
+						  data->Total_In_Meter_prg +=  data->Total_In_Meter;
+						  data->Total_BET_meter_prg += data->Total_BET_meter;
+						  data->HopperMeter_prg += data->HopperMeter;
+
+						  intToBCDArray(data->Total_In_Meter_prg, data->Total_In_Meter_prg_A);
+						  intToBCDArray(data->Total_BET_meter_prg,  data->Total_BET_meter_prg_A);
+						  intToBCDArray(data->HopperMeter_prg, data->HopperMeter_prg_A);
+						  intToBCDArray( data->Numero_Apagado_EGM, data->Numero_Apagado_EGM_A );
+
+						  for(int pos = 0; pos < 5 ; pos++){
+							  data->flash_data[pos + 5] =  data->Total_In_Meter_prg_A[pos];
+							  data->flash_data[pos + 10] = data->Total_BET_meter_prg_A[pos];
+							  data->flash_data[pos + 15] = data->HopperMeter_prg_A[pos];
+
+							  //
+							  data->flash_data[pos + 45] = data->Numero_Apagado_EGM_A[pos];
+						  }
+							HAL_I2C_Mem_Write(hi2c2, data->DIRECCION_I2C_MEM, data->Word_address,I2C_MEMADD_SIZE_16BIT, data->flash_data, 64, -1);
+
+							  done = 1;
+
+					}
+			  }
+
+		  }
+
+	return State::Estado_Recepcion_Json;
+}

@@ -1,0 +1,5 @@
+../Core/SAS/SasEgm_aft.cpp:37:6:void SasEgm::liberarBloqueoAft()	16	static
+../Core/SAS/SasEgm_aft.cpp:41:6:void SasEgm::vigilarBloqueoAft()	16	static
+../Core/SAS/SasEgm_aft.cpp:71:6:void SasEgm::responderAftLockStatus(const uint8_t*, uint16_t)	136	static
+../Core/SAS/SasEgm_aft.cpp:212:6:void SasEgm::responderAftTransfer(const uint8_t*, uint16_t)	248	static
+../Core/SAS/SasEgm_aft.cpp:370:6:void SasEgm::armarRespuestaAft(EstadoTransferAft, uint8_t, uint64_t)	112	static

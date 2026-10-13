@@ -1,0 +1,449 @@
+/*
+ * Statemachine_aft.cpp
+ *
+ *  AFT - Transferencia electronica de fondos.  Seccion 8 del SAS 6.02.
+ *
+ *  Aqui vive todo lo que necesita el cash out remoto que dispara mi host.
+ *  Lo puse en su propio archivo porque StateMachine.cpp ya estaba grande y
+ *  porque esto es una pieza que se entiende sola: entra un bloqueo, sale un
+ *  pago, se desbloquea.
+ *
+ *  LO QUE SI HACE:  retiro de la maquina al host -tipo 0x80-.
+ *  LO QUE NO HACE:  cargar credito desde el host, tickets, bonos, debito.
+ *                   Todo eso se rechaza con su codigo de error; no se finge.
+ */
+
+#include "SasEgm.h"
+
+// ---------------------------------------------------------------------------
+//  ESTADO DEL AFT
+//
+//  A nivel de archivo y NO como miembros de la clase, por la misma razon de
+//  siempre: agregar miembros cambia el tamano de StateMachine y una
+//  compilacion incremental de CubeIDE con el tamano viejo corrompe memoria.
+//  Ya me paso una vez y la placa escupia bytes sueltos.
+// ---------------------------------------------------------------------------
+static EstadoAft g_aftEstado = EstadoAft::LIBRE;
+static uint32_t g_aftMsBloqueo               = 0;   // cuando empezo el bloqueo
+
+// Ultima transferencia, para poder contestar una interrogacion despues.
+static uint8_t  g_aftUltEstado   = 0x00;   // codigo de la tabla 8.3e
+static uint8_t  g_aftUltTipo     = 0x80;
+static uint64_t g_aftUltCentavos = 0;
+static uint8_t  g_aftUltTxIdLen  = 0;
+static uint8_t  g_aftUltTxId[20] = {0};
+
+// ---------------------------------------------------------------------------
+//  POSICION EN EL BUFFER DE HISTORIAL
+//
+//  El manual permite contestar 0x00, que significa "la transferencia actual,
+//  no esta en el historial".  Eso fue lo que hice primero, y estaba mal PARA
+//  MI HOST: el usa justo ese byte para darse cuenta de que hay una
+//  transferencia NUEVA.
+//
+//      const uint8_t indiceTx = sasBuffer[3];
+//      else if ((estado == 0x00 || estado == 0x01) && indiceTx != aftUltimoIndice)
+//
+//  Con un cero fijo, el primer cash out se anotaba y del segundo en adelante
+//  el host los veia identicos al anterior y los IGNORABA en silencio.  El
+//  dinero salia de la maquina y el sistema no se enteraba.
+//
+//  Asi que se incrementa en cada transferencia completada, dando la vuelta
+//  de 1 a 0x7F -el 0 queda reservado para "actual"-.
+// ---------------------------------------------------------------------------
+static uint8_t  g_aftPosBuffer   = 0;
+
+// Diagnostico: se miran en el debugger.
+static uint32_t g_aftBloqueos    = 0;
+static uint32_t g_aftTransferidas= 0;
+static uint32_t g_aftRechazadas  = 0;
+
+
+// ---------------------------------------------------------------------------
+//  EL BLOQUEO NO PUEDE SER ETERNO
+//
+//  Corre en cada vuelta del lazo.  Si el host pidio bloqueo y nunca mando la
+//  transferencia -se cayo, se reinicio, perdio el enlace-, la placa se suelta
+//  sola pasado AFT_TIMEOUT_BLOQUEO_MS.
+//
+//  Sin esto, un host que se muere a la mitad deja la maquina bloqueada para
+//  siempre.  El manual lo pide explicito: si el EGM entra en una condicion
+//  donde no puede jugar, o el enlace se cae, tiene que volver a "no locked".
+// ---------------------------------------------------------------------------
+// Suelta el bloqueo, venga de donde venga la razon.  La usa el timeout de
+// aqui abajo y tambien la vigilancia del enlace cuando el host desaparece.
+void SasEgm::liberarBloqueoAft() {
+    g_aftEstado = EstadoAft::LIBRE;
+}
+
+void SasEgm::vigilarBloqueoAft() {
+    if (!AFT_ACTIVO) return;
+    if (g_aftEstado == EstadoAft::LIBRE) return;
+
+    if ((HAL_GetTick() - g_aftMsBloqueo) >= AFT_TIMEOUT_BLOQUEO_MS) {
+        g_aftEstado = EstadoAft::LIBRE;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+//  LONG POLL 0x74  -  bloqueo y estado
+//
+//  Peticion (tabla 8.2a), 8 bytes:
+//      01 74 <codigo> <condicion> <timeout 2 BCD> <CRC 2>
+//
+//      codigo 00 = pedir bloqueo
+//             80 = cancelar bloqueo
+//             FF = solo preguntar, NO tocar nada
+//
+//  Respuesta (tabla 8.2b), 40 bytes clavados:
+//      01 74 23 <activo 4> <estado 1> <transf disponibles 1>
+//      <cashout host 1> <estado aft 1> <max buffer 1>
+//      <cashable 5 BCD> <restringido 5> <no restringido 5> <limite 5>
+//      <expiracion 4 BCD> <pool 2> <CRC 2>
+//
+//  El 0x23 es el largo de lo que sigue sin contar el CRC: 35 bytes.
+//  4+1+1+1+1+1+5+5+5+5+4+2 = 35.  Si esa cuenta no cuadra, el host lee la
+//  trama corrida y todo lo de atras es basura.
+// ---------------------------------------------------------------------------
+void SasEgm::responderAftLockStatus(const uint8_t* trama, uint16_t largoTrama) {
+    if (!AFT_ACTIVO) return;              // callados: no prometemos AFT
+    if (trama == nullptr || largoTrama < 6) return;
+
+    const uint8_t codigo = trama[2];
+
+    // --- Que hacer con el bloqueo -----------------------------------------
+    if (codigo == 0x80) {
+        // Cancelar.  Siempre se puede.
+        g_aftEstado = EstadoAft::LIBRE;
+    }
+    else if (codigo == 0x00) {
+        // Pedir bloqueo.  El manual prohibe bloquear si la maquina esta
+        // esperando un hand pay: ya hay dinero comprometido y meter una
+        // transferencia encima seria pagarlo dos veces.
+        const bool puedoBloquear = (g_aftEstado == EstadoAft::LIBRE) &&
+                                   !hayHandpayPendiente();
+
+        if (puedoBloquear) {
+            // -----------------------------------------------------------
+            //  SE BLOQUEA DE UNA VEZ, NO SE DEJA "PENDIENTE".
+            //
+            //  Esto lo tenia mal y el log del 24/09 lo dejo clarisimo:
+            //
+            //      [host]  01 74 00 03 10 00      pedir bloqueo
+            //      [placa] 01 74 23 ... 40 ...    "pendiente"
+            //      [placa] 6F                     "juego bloqueado"
+            //      [host]  01 74 FF 00 00 00      "a ver, como vas?"
+            //      [placa] 01 74 23 ... 40 ...    "pendiente"   <-- PARA SIEMPRE
+            //
+            //  Yo ponia PENDIENTE y nunca escribia BLOQUEADO en ningun lado,
+            //  asi que el host preguntaba, veia 0x40, y se rendia.
+            //
+            //  El estado "pendiente" del manual es para una maquina que
+            //  necesita TIEMPO: tiene que terminar la jugada en curso antes
+            //  de poder bloquearse.  Esta placa no juega nada, no tiene nada
+            //  que terminar: en el momento en que decido conceder el
+            //  bloqueo, la maquina YA esta bloqueada.  Contestar 0x00 no es
+            //  un atajo, es lo que de verdad esta pasando.
+            //
+            //  Asi quedan contentos los dos tipos de host: el que se guia
+            //  por la excepcion 0x6F la recibe igual, y el que interroga el
+            //  estado con 0x74 FF recibe un 0x00 firme desde la primera vez.
+            // -----------------------------------------------------------
+            g_aftEstado    = EstadoAft::BLOQUEADO;
+            g_aftMsBloqueo = HAL_GetTick();
+            g_aftBloqueos++;
+
+            encolarExcepcionSas(SAS_EXC_JUEGO_BLOQUEADO);
+        }
+    }
+    // codigo 0xFF -interrogar- no toca nada, por mandato del manual.
+
+    // --- Armar la respuesta -----------------------------------------------
+    uint8_t  r[40];
+    uint16_t n = 0;
+
+    r[n++] = DIRECCION_SAS;
+    r[n++] = 0x74;
+    r[n++] = 0x23;                       // 35 bytes siguen, sin contar CRC
+
+    // Numero de activo, byte bajo primero.
+    r[n++] = (uint8_t)( NUMERO_ACTIVO        & 0xFF);
+    r[n++] = (uint8_t)((NUMERO_ACTIVO >>  8) & 0xFF);
+    r[n++] = (uint8_t)((NUMERO_ACTIVO >> 16) & 0xFF);
+    r[n++] = (uint8_t)((NUMERO_ACTIVO >> 24) & 0xFF);
+
+    // Estado del bloqueo.  El 0x40 -pendiente- es lo que mi host espera en
+    // la primera respuesta; el 0x6F que va detras es el que lo mueve.
+    switch (g_aftEstado) {
+        case EstadoAft::BLOQUEADO: r[n++] = 0x00; break;
+
+        // PENDIENTE existe en el enum pero esta placa nunca lo usa: no tiene
+        // jugada que terminar antes de bloquearse.  Lo dejo declarado porque
+        // es un estado legitimo del protocolo y si algun dia la placa tiene
+        // que esperar algo -un pulso a medias, por ejemplo- este es el lugar.
+        case EstadoAft::PENDIENTE: r[n++] = 0x40; break;
+        default:                   r[n++] = 0xFF; break;
+    }
+
+    // Transferencias disponibles.  Bit 1 = "se puede transferir DESDE la
+    // maquina".  Los demas en cero y es la verdad: esta placa no recibe
+    // credito del host, no tiene impresora y no hace bonos.  Prender un bit
+    // aqui es prometer algo que despues no se puede cumplir.
+    r[n++] = (creditoActual() > 0) ? 0x02 : 0x00;
+
+    // Estado del cash out al host: el bit 1 dice que esta habilitado.
+    r[n++] = 0x02;
+
+    // Estado de AFT.  Bit 7 = "AFT habilitado", bit 4 = "transferencias
+    // in-house habilitadas", bit 1 = "acepto transferir menos del total".
+    // Ese ultimo importa: mi host pide 99 99 99 99 99 -o sea "todo"- y sin
+    // ese bit tendria que rechazarle cualquier monto que no sea exacto.
+    r[n++] = 0x92;
+
+    // Tope del buffer de historial.  La tabla 8.2b solo admite de 0x46 a
+    // 0x7F, o sea que no hay forma de declarar "guardo una sola".  Pongo el
+    // minimo que el manual permite en vez del maximo, para no prometer un
+    // historial grande que no tengo.
+    //
+    // LIMITACION CONOCIDA: solo guardo la ULTIMA transferencia.  Si el host
+    // interroga una posicion vieja, le contesto la ultima.  Mi host no lo
+    // hace, pero queda escrito.
+    r[n++] = 0x46;
+
+    // Importes, TODOS en centavos (tabla 8.2b).
+    const uint64_t centavos = (uint64_t)creditoActual() *
+                              (uint64_t)SAS_CREDITOS_POR_PULSO *
+                              (uint64_t)CENTAVOS_POR_CREDITO;
+
+    bcdEncodeSas(&r[n], centavos, 5); n += 5;   // cashable: lo que hay
+    bcdEncodeSas(&r[n], 0,        5); n += 5;   // restringido: no manejamos
+    bcdEncodeSas(&r[n], 0,        5); n += 5;   // no restringido: tampoco
+
+    // Limite de lo que se puede transferir HACIA la maquina.  Cero, porque
+    // esta placa no sabe recibir credito: solo paga.
+    bcdEncodeSas(&r[n], 0, 5); n += 5;
+
+    bcdEncodeSas(&r[n], 0, 4); n += 4;   // expiracion de lo restringido
+    r[n++] = 0x00; r[n++] = 0x00;        // pool ID
+
+    const uint16_t crc = calcularCrc16Kermit(r, n);
+    r[n++] = (uint8_t)(crc & 0xFF);
+    r[n++] = (uint8_t)((crc >> 8) & 0xFF);
+
+    enviarTramaSas(r, n);                // n tiene que ser 40
+}
+
+
+// ---------------------------------------------------------------------------
+//  LONG POLL 0x72  -  la transferencia
+//
+//  Peticion (tabla 8.3a):
+//      01 72 <largo> <codigo> <indice> <tipo> <cashable 5 BCD>
+//      <restringido 5> <no restringido 5> <banderas 1> <activo 4>
+//      <llave 20> <largo txid 1> <txid N> ... <CRC 2>
+//
+//      codigo 00 = solo transferencia completa
+//             01 = se permite parcial
+//             80 = cancelar
+//             FE/FF = solo interrogar
+//
+//      tipo   80 = de la maquina al host  <- el unico que hacemos
+//             00 = del host a la maquina  <- se rechaza
+//
+//  Mi host manda: 01 72 47 01 00 80 99 99 99 99 99 ...
+//  o sea "sacame todo lo que puedas, acepto parcial".
+// ---------------------------------------------------------------------------
+void SasEgm::responderAftTransfer(const uint8_t* trama, uint16_t largoTrama) {
+    if (!AFT_ACTIVO) return;
+    if (trama == nullptr || largoTrama < 6) return;
+
+    const uint8_t largoDatos = trama[2];
+    const uint8_t codigo     = trama[3];
+
+    // --- Interrogacion: repetir lo ultimo sin tocar nada -------------------
+    if (codigo == 0xFE || codigo == 0xFF) {
+        armarRespuestaAft(g_aftUltEstado, g_aftUltTipo, g_aftUltCentavos);
+        return;
+    }
+
+    if (largoDatos < 4 || largoTrama < (uint16_t)(3 + largoDatos + 2)) return;
+
+    const uint8_t tipo          = trama[5];
+    const bool    permiteParcial= (codigo == 0x01);
+
+    // Monto pedido, en centavos.  5 BCD a partir del byte 6.
+    uint64_t pedidoCentavos = 0;
+    for (uint8_t i = 0; i < 5; i++) {
+        const uint8_t b = trama[6 + i];
+        pedidoCentavos = pedidoCentavos * 100 + (uint64_t)((b >> 4) * 10 + (b & 0x0F));
+    }
+
+    // Guardo el txid para devolverselo igual: el host lo usa para saber de
+    // que transferencia le estoy hablando.
+    g_aftUltTxIdLen = 0;
+    {
+        const uint16_t posLargoTx = (uint16_t)(3 + 1 + 1 + 1 + 15 + 1 + 4 + 20);
+        if (posLargoTx < largoTrama) {
+            uint8_t l = trama[posLargoTx];
+            if (l > 20) l = 20;
+            if ((uint16_t)(posLargoTx + 1 + l) <= largoTrama) {
+                for (uint8_t i = 0; i < l; i++) g_aftUltTxId[i] = trama[posLargoTx + 1 + i];
+                g_aftUltTxIdLen = l;
+            }
+        }
+    }
+
+    // --- Cancelacion -------------------------------------------------------
+    if (codigo == 0x80) {
+        g_aftEstado = EstadoAft::LIBRE;
+        armarRespuestaAft(0xC0, tipo, 0);       // C0 = no hay transferencia
+        return;
+    }
+
+    // --- Lo que esta placa NO sabe hacer -----------------------------------
+    //
+    // Cualquier tipo que no sea "de la maquina al host" se rechaza con su
+    // codigo.  Rechazar es una respuesta valida y honesta; contestar "listo"
+    // a una carga que nunca ocurrio le mueve la contabilidad al casino.
+    if (tipo != 0x80) {
+        g_aftRechazadas++;
+        armarRespuestaAft(0x8F, tipo, 0);       // 8F = tipo no soportado
+        return;
+    }
+
+    // --- Cuanto hay de verdad ----------------------------------------------
+    const uint64_t disponibleCentavos = (uint64_t)creditoActual() *
+                                        (uint64_t)SAS_CREDITOS_POR_PULSO *
+                                        (uint64_t)CENTAVOS_POR_CREDITO;
+
+    // Sin credito no hay nada que transferir... salvo que estemos corriendo
+    // la sonda de escala, que justamente se hace con el credito en CERO
+    // para poder distinguir de donde saca el host el numero.
+    if (disponibleCentavos == 0 && !AFT_MONTO_CANARIO_ACTIVO) {
+        g_aftRechazadas++;
+        armarRespuestaAft(0x9A, tipo, 0);       // 9A = no hay credito
+        return;
+    }
+
+    uint64_t aTransferir = pedidoCentavos;
+    uint8_t  estado      = 0x00;                // 00 = completa
+
+    if (pedidoCentavos > disponibleCentavos) {
+        // Mi host pide 99 99 99 99 99, que es su forma de decir "todo".
+        // Con parcial permitido le doy lo que hay y le aviso que fue
+        // parcial; sin parcial permitido no puedo hacer nada.
+        if (!permiteParcial) {
+            g_aftRechazadas++;
+            armarRespuestaAft(0x92, tipo, 0);   // 92 = no se permite parcial
+            return;
+        }
+        aTransferir = disponibleCentavos;
+        estado      = 0x01;                     // 01 = parcial
+    }
+
+    // --- El pago -----------------------------------------------------------
+    //
+    // set_AftOut, NO set_Handpay.  Sube el medidor 0x18 -transferencias
+    // electronicas al host- y baja el saldo, sin tocar el 0x04 ni el 0x23.
+    //
+    // Un retiro por AFT no es un credito cancelado: nadie lo pago a mano,
+    // viajo por el sistema.  Si los mezclara, el casino perderia la unica
+    // forma de distinguir un pago de atendiente de uno remoto, y ademas el
+    // hand pay pendiente que levanta set_Handpay impediria el SIGUIENTE
+    // bloqueo de AFT -el manual lo prohibe mientras haya un pago esperando-.
+    const uint32_t creditos = (uint32_t)(aTransferir /
+                              ((uint64_t)CENTAVOS_POR_CREDITO * (uint64_t)SAS_CREDITOS_POR_PULSO));
+    set_AftOut(creditos);
+
+    g_aftTransferidas++;
+    g_aftEstado = EstadoAft::LIBRE;             // la transferencia suelta el bloqueo
+
+    // Posicion nueva: es lo que le dice a mi host que esta es OTRA
+    // transferencia y no la misma de antes.  Ver la nota larga arriba.
+    g_aftPosBuffer = (uint8_t)((g_aftPosBuffer % 0x7F) + 1);
+
+    // Sonda de escala: si esta encendida, se REPORTA el monto canario en
+    // vez del real.  Los medidores ya se movieron con el monto de verdad
+    // unas lineas arriba, asi que la contabilidad interna sigue sana: lo
+    // unico alterado es el numero que viaja en la trama, que es justo lo
+    // que se quiere medir.
+    const uint64_t montoReportado = AFT_MONTO_CANARIO_ACTIVO
+                                  ? (uint64_t)AFT_MONTO_CANARIO
+                                  : aTransferir;
+
+    armarRespuestaAft(estado, tipo, montoReportado);
+
+    // Y se le avisa que ya quedo.  Prioritaria, igual que el 0x51.
+    encolarExcepcionSas(SAS_EXC_AFT_COMPLETA);
+}
+
+
+// ---------------------------------------------------------------------------
+//  LA RESPUESTA DEL 0x72  (tabla 8.3c)
+//
+//      01 72 <largo> <posicion> <estado> <recibo> <tipo>
+//      <cashable 5 BCD> <restringido 5> <no restringido 5> <banderas 1>
+//      <activo 4> <largo txid 1> <txid N> <fecha 4 BCD> <hora 3 BCD>
+//      <expiracion 4 BCD> <pool 2> <3 tamanos de medidor acumulado> <CRC 2>
+//
+//  Los tres medidores acumulados van con tamano CERO.  El manual lo permite
+//  -"0 until complete"- y es lo correcto aqui: esta placa no lleva medidores
+//  acumulados por tipo de transferencia.  Mandar un tamano y no los bytes
+//  seria desincronizar al host.
+// ---------------------------------------------------------------------------
+void SasEgm::armarRespuestaAft(uint8_t estado, uint8_t tipo, uint64_t centavos) {
+    uint8_t  r[80];
+    uint16_t n = 0;
+
+    r[n++] = DIRECCION_SAS;
+    r[n++] = 0x72;
+    const uint16_t posLargo = n;
+    r[n++] = 0x00;                        // se rellena al final
+
+    r[n++] = g_aftPosBuffer;              // posicion en el historial
+    r[n++] = estado;                      // tabla 8.3e
+    r[n++] = 0xFF;                        // recibo: no se imprimio ninguno
+    r[n++] = tipo;
+
+    bcdEncodeSas(&r[n], centavos, 5); n += 5;   // cashable transferido
+    bcdEncodeSas(&r[n], 0,        5); n += 5;   // restringido
+    bcdEncodeSas(&r[n], 0,        5); n += 5;   // no restringido
+
+    // Banderas: bit 3 = el host pidio el retiro, bit 1 = cash out habilitado.
+    r[n++] = 0x0A;
+
+    r[n++] = (uint8_t)( NUMERO_ACTIVO        & 0xFF);
+    r[n++] = (uint8_t)((NUMERO_ACTIVO >>  8) & 0xFF);
+    r[n++] = (uint8_t)((NUMERO_ACTIVO >> 16) & 0xFF);
+    r[n++] = (uint8_t)((NUMERO_ACTIVO >> 24) & 0xFF);
+
+    // El mismo txid que me mando, para que sepa de cual le hablo.
+    r[n++] = g_aftUltTxIdLen;
+    for (uint8_t i = 0; i < g_aftUltTxIdLen; i++) r[n++] = g_aftUltTxId[i];
+
+    // Fecha y hora.  En ceros: esta placa no tiene reloj de tiempo real.
+    // Es dato faltante, no dato inventado.
+    bcdEncodeSas(&r[n], 0, 4); n += 4;
+    bcdEncodeSas(&r[n], 0, 3); n += 3;
+
+    bcdEncodeSas(&r[n], 0, 4); n += 4;    // expiracion
+    r[n++] = 0x00; r[n++] = 0x00;         // pool ID
+
+    r[n++] = 0x00;                        // acumulado cashable: tamano 0
+    r[n++] = 0x00;                        // acumulado restringido: tamano 0
+    r[n++] = 0x00;                        // acumulado no restringido: tamano 0
+
+    r[posLargo] = (uint8_t)(n - 3);
+
+    const uint16_t crc = calcularCrc16Kermit(r, n);
+    r[n++] = (uint8_t)(crc & 0xFF);
+    r[n++] = (uint8_t)((crc >> 8) & 0xFF);
+
+    enviarTramaSas(r, n);
+
+    // Se guarda por si el host interroga despues con codigo FE o FF.
+    g_aftUltEstado   = estado;
+    g_aftUltTipo     = tipo;
+    g_aftUltCentavos = centavos;
+}

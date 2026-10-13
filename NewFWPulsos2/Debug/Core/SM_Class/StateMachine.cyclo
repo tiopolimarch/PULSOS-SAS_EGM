@@ -1,0 +1,7 @@
+../Core/SM_Class/../SM_Class/StateMachine.h:169:11:Signal::Signal()	1
+../Core/SM_Class/../SM_Class/../JSON/../Src/VariablesGlobales.h:37:8:VariablesGlobales::VariablesGlobales()	1
+../Core/SM_Class/StateMachine.cpp:11:1:StateMachine::StateMachine()	1
+../Core/SM_Class/StateMachine.cpp:30:6:void StateMachine::Asigna_Perifericos(TIM_HandleTypeDef*, UART_HandleTypeDef*, UART_HandleTypeDef*, IWDG_HandleTypeDef*, I2C_HandleTypeDef*, ADC_HandleTypeDef*, PulseGenerator*)	1
+../Core/SM_Class/StateMachine.cpp:55:6:void StateMachine::runStateMachine(volatile Flags&)	12
+../Core/SM_Class/StateMachine.cpp:174:6:void StateMachine::manejarInterrupcionTx(UART_HandleTypeDef*)	3
+../Core/SM_Class/StateMachine.cpp:210:6:void StateMachine::manejarInterrupcionIdleRx(UART_HandleTypeDef*, uint16_t)	3

@@ -1,0 +1,272 @@
+/*
+ * SasEgm.h
+ *
+ *  SAS 6.02 LADO MAQUINA (EGM), COMO LIBRERIA.
+ *
+ *  Se usa asi, y no hace falta nada mas:
+ *
+ *      #include "SasEgm.h"
+ *
+ *      SasEgm* SAS_obj = SasEgm::getInstance();
+ *
+ *      // al arrancar, despues de MX_USARTx_UART_Init()
+ *      SAS_obj->begin(&huart2);
+ *
+ *      // en la maquina de estados, en cada vuelta (las dos son lo mismo)
+ *      SAS_obj->poleoSimple_SAS();
+ *      SAS_obj->servicio();
+ *
+ *      // cuando el firmware mueve dinero
+ *      SAS_obj->set_CurrentCredit(200);
+ *      SAS_obj->set_Bet(5);
+ *      SAS_obj->set_Handpay(50);
+ *
+ *  Y en los callbacks del HAL, una linea cada uno (el propio SAS revisa si
+ *  el UART es el suyo, no hace falta el if):
+ *
+ *      SAS_obj->onRxEvent(huart, size);     // HAL_UARTEx_RxEventCallback
+ *      SAS_obj->onTxComplete(huart);        // HAL_UART_TxCpltCallback
+ *      SAS_obj->onError(huart);             // HAL_UART_ErrorCallback
+ *
+ *  No depende de ningun archivo del proyecto: solo de main.h, que CubeMX
+ *  genera siempre y que trae el HAL de la familia que sea (F1, F4...).
+ *
+ *  POR QUE INSTANCIA UNICA.  Hay un solo bus SAS y una sola contabilidad
+ *  por placa.  Dos objetos serian dos contabilidades contestandole al mismo
+ *  host y los medidores empezarian a contradecirse sin que nada marcara error.
+ */
+
+#ifndef SRC_SASEGM_H_
+#define SRC_SASEGM_H_
+
+#include "main.h"
+#include "SasReceiver.h"
+
+// En que punto de la secuencia de AFT vamos.
+enum class EstadoAft : uint8_t {
+	LIBRE = 0,      // 0xFF para el host
+	PENDIENTE,      // 0x40
+	BLOQUEADO       // 0x00 - listo para recibir la transferencia
+};
+
+// Lo que devuelve begin().  Si no es OK, el SAS NO arranca y dice por que:
+// son justo los errores de configuracion de CubeMX que hacen que "no
+// funcione" sin ningun otro sintoma.
+enum class SasBeginResultado : uint8_t {
+	OK = 0,
+	SIN_UART,              // se paso nullptr
+	NO_ES_9_BITS,          // Word length tiene que ser 9 bits
+	CON_PARIDAD,           // Parity tiene que ser None
+	SIN_DMA_RX,            // falta el DMA de RX (o su handle en main)
+	DMA_RX_NO_CIRCULAR,    // el DMA de RX tiene que ser Circular
+	DMA_RX_NO_HALFWORD     // el DMA de RX tiene que ser Half Word
+};
+
+class SasEgm {
+public:
+	// =====================================================================
+	//  1. LA INSTANCIA
+	// =====================================================================
+	static SasEgm* getInstance();
+
+	// =====================================================================
+	//  2. ARRANQUE  -  una vez, despues de inicializar el UART
+	//
+	//  El UART: 19200, 9 bits, sin paridad, 1 stop, DMA RX circular halfword.
+	//  El DMA de TX es opcional: si no esta, se transmite por interrupcion.
+	// =====================================================================
+	SasBeginResultado begin(UART_HandleTypeDef* huartSas);
+
+	// OPCIONAL.  Si tu placa ya lleva contadores de pulsos persistentes
+	// (en EEPROM), se los prestas y el SAS los reporta como medidores.
+	// Cualquiera puede ir en nullptr.  Si no llamas esto, los medidores salen
+	// solo de lo que metas con los set_*.
+	//
+	//   billIn    entrada de billetero    -> medidor 0x0B (y sube el saldo)
+	//   apostado  total apostado          -> medidor 0x00
+	//   cashOut   pulsos de hopper        -> medidor 0x04 / 0x23 (y baja el saldo)
+	//   handpay   pulsos de hand pay      -> medidor 0x03
+	void vincularContadores(const int* billIn, const int* apostado,
+	                        const int* cashOut, const int* handpay);
+
+	// =====================================================================
+	//  3. EL SERVICIO  -  en CADA vuelta del lazo
+	//
+	//  Contesta los poleos del host.  Si deja de llamarse, el enlace SAS se
+	//  cae.  Por eso tiene que correr en todas las vueltas, o en un estado
+	//  del que la maquina no salga.
+	// =====================================================================
+	void servicio();
+
+	// El mismo servicio() con el nombre del poleo del host, para usar un nombre
+	// mas familiar.
+	void poleoSimple_SAS() { servicio(); }
+
+	// =====================================================================
+	//  4. INTERRUPCIONES  -  pasar el huart tal cual llega al callback
+	// =====================================================================
+	void onRxEvent(UART_HandleTypeDef* huart, uint16_t size);
+	void onTxComplete(UART_HandleTypeDef* huart);
+	void onError(UART_HandleTypeDef* huart);
+
+	// =====================================================================
+	//  5. MOVER MEDIDORES  -  todo en CREDITOS, nunca en centavos
+	// =====================================================================
+	uint32_t creditoActual() const;             // saldo en creditos
+
+	void set_CurrentCredit(uint32_t creditos);  // FIJA el saldo 0x1A; si sube, sube el 0x0B
+	void set_Handpay(uint32_t creditos);        // SUMA: 0x04 y 0x23, baja el saldo, avisa 0x51
+	void set_Bet(uint32_t creditos);            // SUMA: 0x00
+
+	// Cash out propio de la placa, ya pagado.  Si se apunta o no lo decide
+	// CASHOUT_REFLEJA_EN_SAS (abajo), para no contarlo dos veces.
+	void registrarCashOutLocal(uint32_t creditos);
+
+	void reiniciarContabilidad();               // todo a cero
+
+	// =====================================================================
+	//  6. ESTADO  (solo lectura)
+	// =====================================================================
+	bool enlaceArriba() const;                  // el host esta poleando
+	uint32_t poleosContestados() const { return sasPoleosContestados_; }
+
+private:
+	// =====================================================================
+	//  CONFIGURACION  -  REVISAR ANTES DE USAR
+	//
+	//  Todas son constantes de compilacion a proposito: mueven dinero, y
+	//  cambiarlas tiene que costar editar, recompilar y flashear.
+	// =====================================================================
+
+	// Direccion en el bus, de 1 a 127.  Se contesta el poleo (DIRECCION|0x80).
+	static const uint8_t DIRECCION_SAS = 0x01;
+
+	// Cuantos creditos vale un pulso.  1 PULSO = 1 CREDITO = $1.00
+	// Los medidores SAS viajan en CREDITOS; el host los multiplica por la
+	// denominacion que se declara en el 0x1F.
+	static const uint32_t SAS_CREDITOS_POR_PULSO = 1;
+
+	// Denominacion, tabla C-4: 0x01 = $0.01, 0x06 = $1.00.
+	static const uint8_t CODIGO_DENOMINACION = 0x06;
+	static const uint8_t APUESTA_MAXIMA      = 0x00;   // POR CONFIRMAR
+	static const uint8_t GRUPO_PROGRESIVO    = 0x00;   // no hay progresivo
+	static const uint8_t OPCIONES_JUEGO_HI   = 0x00;
+	static const uint8_t OPCIONES_JUEGO_LO   = 0x00;
+
+	// Identidad (0x54 y 0x1F).  Se definen en SasEgm.cpp.
+	static const char* const SAS_VERSION_ASCII;     // "602"
+	static const char* const SERIE_MAQUINA;         // la dada de alta en el casino
+	static const char* const ID_JUEGO_ASCII;        // 2 caracteres
+	static const char* const ID_JUEGO_EXTRA_ASCII;  // 3 caracteres
+	static const char* const ID_PAYTABLE_ASCII;     // 6 caracteres
+	static const char* const PORCENTAJE_PAGO_ASCII; // 4 caracteres, sin punto
+
+	// Numero de activo para AFT.  El host lo manda en su trama 0x72.
+	static const uint32_t NUMERO_ACTIVO = 1;
+
+	// Contesta el 0x74 y el 0x72 (retiro de la maquina al host).
+	static const bool AFT_ACTIVO = true;
+
+	// Avisa los hand pay con la excepcion 0x51.  Va en true.
+	static const bool EXCEPCIONES_SAS_ACTIVO = true;
+
+	// PARCHE DE HOST: el monto del 0x1B va en centavos porque nuestro host
+	// divide entre 100.  Un host que lee la denominacion del 0x1F necesita
+	// false, o los montos salen multiplicados por cien.  Prueba: hand pay de
+	// 10 creditos; si el host muestra $0.10 -> true, $1,000.00 -> false.
+	static const bool HANDPAY_1B_EN_CENTAVOS = true;
+	static const uint32_t CENTAVOS_POR_CREDITO = 100;   // 1 credito = $1.00
+
+	// CABLEADO: si los pulsos del hopper REGRESAN por la entrada de la placa,
+	// el medidor ya sube solo y esto va en false (si no, se cuenta dos
+	// veces).  Si NO regresan, va en true.  Se define en SasEgm.cpp.
+	static const bool CASHOUT_REFLEJA_EN_SAS;
+
+	// Silencio antes de dar el host por caido.
+	static const uint32_t ENLACE_TIMEOUT_MS = 5000;
+
+	// Si el host no pide el bloqueo AFT a tiempo, se suelta solo.
+	static const uint32_t AFT_TIMEOUT_BLOQUEO_MS = 15000;
+
+	// =====================================================================
+	//  CONSTANTES DEL PROTOCOLO  -  no se tocan
+	// =====================================================================
+	static const uint8_t  SAS_MAX_MEDIDORES   = 60;     // tabla 7.3b
+	static const uint8_t  SAS_2F_LARGO_MAX    = 0x3E;   // tabla 7.3b
+	static const uint32_t SAS_REEMITIR_51_MS  = 15000;  // seccion 7.8.1
+	static const uint32_t SAS_EDAD_MAXIMA_MS  = 20;     // trama mas vieja se tira
+
+	static const uint8_t SAS_EXC_HANDPAY_PENDIENTE = 0x51;
+	static const uint8_t SAS_EXC_HANDPAY_RESETEADO = 0x52;
+	static const uint8_t SAS_EXC_JUEGO_BLOQUEADO   = 0x6F;
+	static const uint8_t SAS_EXC_AFT_COMPLETA      = 0x69;
+
+	// =====================================================================
+	//  ESTADO INTERNO
+	// =====================================================================
+	SasEgm() = default;
+	SasEgm(const SasEgm&)            = delete;
+	SasEgm& operator=(const SasEgm&) = delete;
+
+	SasReceiver         rx_;
+	UART_HandleTypeDef* huart_    = nullptr;
+	bool                iniciado_ = false;
+
+	// Contadores prestados en vincularContadores().  Cualquiera puede ser nullptr.
+	const int* pBillIn_   = nullptr;
+	const int* pApostado_ = nullptr;
+	const int* pCashOut_  = nullptr;
+	const int* pHandpay_  = nullptr;
+
+	uint8_t  bufferRecepcionSas_[260] = {};
+	uint32_t temporizadorUltimoSas_   = 0;
+
+	// Diagnostico: se miran en el debugger.
+	uint32_t sasPoleosContestados_ = 0;
+	uint32_t sasTramasAtendidas_   = 0;
+	uint32_t sasCrcMalos_          = 0;
+	uint32_t sasNackImplicitos_    = 0;
+
+	// =====================================================================
+	//  MOTOR
+	// =====================================================================
+	void atenderSas();
+	void ProcesarComandoSAS(const uint8_t* trama, uint16_t largoTrama);
+	bool procesarComandoContadoresDetallados(const uint8_t* trama, uint16_t largoTrama);
+
+	void actualizarCreditoPorPulsos();
+	void reemitirExcepcionHandpay();
+	void vigilarEnlace();
+	void encolarExcepcionSas(uint8_t codigo);
+
+	// Puente codigo de medidor SAS -> valor.  Unico lugar donde se decide
+	// que numero contesta la placa para cada medidor.
+	bool obtenerValorMedidorRuta(uint8_t codigo, uint64_t* salida);
+	uint64_t medidorSas(uint8_t codigo);
+
+	static void bcdEncodeSas(uint8_t* destino, uint64_t valor, uint8_t nBytes);
+	uint16_t calcularCrc16Kermit(const uint8_t* datos, uint16_t longitud);
+	bool enviarTramaSas(const uint8_t* payload, uint16_t longitud);
+
+	void responderContadorBCD(uint8_t comando, uint64_t valor);
+	void responderBloqueMedidores(uint8_t comando, const uint64_t* valores, uint8_t nValores);
+	void responderIdentidadMaquina();
+	void responderHandpayInfo();
+	void responderAckSimple();
+
+	// =====================================================================
+	//  AFT  (SasEgm_aft.cpp)
+	// =====================================================================
+	void responderAftLockStatus(const uint8_t* trama, uint16_t largoTrama);
+	void responderAftTransfer(const uint8_t* trama, uint16_t largoTrama);
+	void armarRespuestaAft(uint8_t estado, uint8_t tipo, uint64_t centavos);
+	void vigilarBloqueoAft();
+	void liberarBloqueoAft();
+	bool hayHandpayPendiente() const;
+
+	// Solo lo llama el AFT: sube el 0x18 sin levantar hand pay.  Privado para
+	// que nadie infle ese medidor sin que haya habido transferencia.
+	void set_AftOut(uint32_t creditos);
+};
+
+#endif /* SRC_SASEGM_H_ */

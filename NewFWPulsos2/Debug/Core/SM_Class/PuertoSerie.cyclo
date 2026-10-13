@@ -1,0 +1,12 @@
+../Core/SM_Class/PuertoSerie.cpp:17:1:PuertoSerie::PuertoSerie()	1
+../Core/SM_Class/PuertoSerie.cpp:21:6:void PuertoSerie::init(UART_HandleTypeDef*)	1
+../Core/SM_Class/PuertoSerie.cpp:36:6:bool PuertoSerie::write(uint8_t*, uint16_t)	8
+../Core/SM_Class/PuertoSerie.cpp:67:6:)	1
+../Core/SM_Class/PuertoSerie.cpp:78:6:)	1
+../Core/SM_Class/PuertoSerie.cpp:93:10:uint16_t PuertoSerie::readBuffer(uint8_t*, uint16_t)	4
+../Core/SM_Class/PuertoSerie.cpp:111:9:uint8_t PuertoSerie::read()	2
+../Core/SM_Class/PuertoSerie.cpp:121:10:uint16_t PuertoSerie::available() const	2
+../Core/SM_Class/PuertoSerie.cpp:129:6:void PuertoSerie::flush()	1
+../Core/SM_Class/PuertoSerie.cpp:134:6:void PuertoSerie::setBaudRate(uint32_t)	2
+../Core/SM_Class/PuertoSerie.cpp:146:6:void PuertoSerie::handleIdleIRQ(uint16_t)	3
+../Core/SM_Class/PuertoSerie.cpp:183:6:void PuertoSerie::handleTxComplete()	7

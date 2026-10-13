@@ -1,0 +1,10 @@
+../Core/SM_Class/Statemachine_estados.cpp:25:7:State StateMachine::ProcesarJsonRecibido(uint8_t*)	10
+../Core/SM_Class/Statemachine_estados.cpp:95:7:State StateMachine::handleInicio(volatile Flags&)	4
+../Core/SM_Class/Statemachine_estados.cpp:149:7:State StateMachine::handleRecepcionJson()	2
+../Core/SM_Class/Statemachine_estados.cpp:172:7:State StateMachine::ResetContadores()	4
+../Core/SM_Class/Statemachine_estados.cpp:229:7:State StateMachine::SolicitudFirmware()	1
+../Core/SM_Class/Statemachine_estados.cpp:239:7:State StateMachine::Estado_Contadores()	1
+../Core/SM_Class/Statemachine_estados.cpp:248:7:State StateMachine::Diagnostico_STM32()	3
+../Core/SM_Class/Statemachine_estados.cpp:312:7:State StateMachine::CashOut_Proceso()	8
+../Core/SM_Class/Statemachine_estados.cpp:399:7:State StateMachine::CashIn_Proceso()	1
+../Core/SM_Class/Statemachine_estados.cpp:408:7:State StateMachine::CallbackCaida_Voltaje()	11

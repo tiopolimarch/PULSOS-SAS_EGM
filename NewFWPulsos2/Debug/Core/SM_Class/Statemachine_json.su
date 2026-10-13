@@ -1,0 +1,5 @@
+../Core/SM_Class/Statemachine_json.cpp:22:10:JsonData StateMachine::CrearJsonData(EventoTipo, const char*)	24	static
+../Core/SM_Class/Statemachine_json.cpp:43:6:void StateMachine::Envio_datos_JSON()	16	static
+../Core/SM_Class/Statemachine_json.cpp:51:6:void StateMachine::SendCashOutError()	16	static
+../Core/SM_Class/Statemachine_json.cpp:60:6:void StateMachine::ReportarErrorCashIn()	16	static
+../Core/SM_Class/Statemachine_json.cpp:68:6:void StateMachine::enviarEventoOn()	16	static

@@ -1,0 +1,221 @@
+/*
+ * StateMachine.cpp
+ *
+ *  Created on: Septiembre 1, 2026
+ *      Author: Saúl Luna Minor
+ *
+ */
+
+#include "../SM_Class/StateMachine.h"
+
+StateMachine::StateMachine():
+	currentState(State::Estado_Inicio),
+	State_Cash_Out(CashOutState::Init),
+	_hiwdg(nullptr),
+	huart_Serial(nullptr),
+	huart_Serial_SAS(nullptr),
+	_htim4(nullptr),
+	Serial(new  PuertoSerie()),
+	hi2c2(nullptr),
+	hadc1(nullptr),
+	pulse(nullptr),
+	CrearJson_obj(new CrearJson()),
+	data(new VariablesGlobales()),
+	sas(SasEgm::getInstance())
+
+{
+}
+
+
+void StateMachine::Asigna_Perifericos(
+		TIM_HandleTypeDef* timer4,
+		UART_HandleTypeDef* Serial_,
+		UART_HandleTypeDef* Serial_2,
+		IWDG_HandleTypeDef* Iwdg,
+		I2C_HandleTypeDef*  I2C_Memoria_externa,
+		ADC_HandleTypeDef* adc1,
+		PulseGenerator* PulseHopper)
+
+{
+
+	hi2c2 = I2C_Memoria_externa;
+	_hiwdg = Iwdg;
+	_htim4 = timer4;
+	huart_Serial = Serial_;
+	huart_Serial_SAS = Serial_2;
+	hadc1 =  adc1;
+	pulse = PulseHopper;
+		 }
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Dispatcher principal de la máquina de estados
+// ─────────────────────────────────────────────────────────────────────────
+
+void StateMachine::runStateMachine( volatile Flags &Obj_Flags)
+		{
+
+	 if (Serial == nullptr) return;
+
+
+		 switch (currentState) {
+
+					 case State::Estado_Inicio:{
+						 currentState = handleInicio( Obj_Flags);
+
+					break;
+					 }
+		  ////////////////////////////////////////////////////////////////////////////
+					 /* Recepción de mensajes por JSON.
+					  */
+					 case State::Estado_Recepcion_Json:{
+						  currentState = handleRecepcionJson();
+
+						 break;
+					 }
+
+		 ////////////////////////////////////////////////////////////////////////////
+					 /* Método de atención a la caida de voltaje.
+					  */
+					 case State::Caida_de_Voltaje:{
+						 currentState = CallbackCaida_Voltaje();
+						 break;
+					 }
+		 ////////////////////////////////////////////////////////////////////////////
+					 /* Reset de Contadores y envio del JSON correspodiente.
+					  */
+					 case State::Estado_Reset_Meters_JSON:{
+						 currentState = ResetContadores();
+
+						 break;
+					 }
+
+		 ////////////////////////////////////////////////////////////////////////////
+					 /* Solicitud de versión de FW con hora y fecha.
+					  */
+					 case State::Estado_Solicitud_de_Version:{
+						 currentState = SolicitudFirmware();
+
+						 break;
+					 }
+
+		 ////////////////////////////////////////////////////////////////////////////
+				 /* Estado de los contadores con sus valores progresivos
+				  */
+					 case State::Estado_Solicitud_de_Estado_Contadores:{
+						  currentState = Estado_Contadores();
+					 break;
+					 }
+
+
+	 ////////////////////////////////////////////////////////////////////////////
+					 /* Estado de los contadores con sus valores progresivos
+					  */
+					 case State::Estado_Diagnostico_STM32:{
+						 currentState = Diagnostico_STM32();
+					 break;
+					 }
+
+	 ////////////////////////////////////////////////////////////////////////////
+						 /* Proceso de Cash Out
+						  */
+						 case State::Proceso_Cash_Out:{
+							 currentState = CashOut_Proceso();
+						 break;
+					 }
+
+	 ////////////////////////////////////////////////////////////////////////////
+					 /* Proceso de Cash In
+					  */
+					 case State::Proceso_Cash_In:{
+						 currentState = CashIn_Proceso();
+					 break;
+					 }
+
+
+
+					 case State::Fin_maquina:{
+							 break;
+						 }
+
+					 default:{
+						  currentState = State::Estado_Inicio;
+
+					 break;
+					 }
+
+
+
+
+
+			 	  }
+
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Callbacks de interrupción UART (llamados desde main.cpp)
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * @brief Maneja la interrupción de transmisión UART completada
+ *
+ * Esta función debe ser llamada desde el callback HAL_UART_TxCpltCallback
+ * que está configurado en main.cpp:
+ *
+ * @code
+ * void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+ *     SM_Obj.manejarInterrupcionTx(huart);
+ * }
+ * @endcode
+ *
+ * @param huart Puntero al handler UART que generó la interrupción
+ */
+void StateMachine::manejarInterrupcionTx(UART_HandleTypeDef* huart) {
+    // Validar que el objeto SAS serial exista
+
+	if (huart->Instance == USART1 ){
+
+		Serial->handleTxComplete();
+
+	}
+
+	if (huart->Instance == USART2 ){
+	sas->onTxComplete(huart);
+	}
+
+
+}
+
+
+/**
+ * @brief Maneja la interrupción IDLE de recepción UART
+ *
+ * Esta función debe ser llamada desde el callback HAL_UARTEx_RxEventCallback
+ * que está configurado en main.cpp:
+ *
+ * @code
+ * void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+ *     SM_Obj.manejarInterrupcionIdleRx(huart, Size);
+ * }
+ * @endcode
+ *
+ * El callback HAL_UARTEx_RxEventCallback se genera cuando:
+ *   - Se recibe una línea IDLE (final de trama)
+ *   - Se llena el buffer DMA
+ *
+ * @param huart Puntero al handler UART que generó la interrupción
+ * @param Size Número de bytes recibidos desde el último evento
+ */
+void StateMachine::manejarInterrupcionIdleRx(UART_HandleTypeDef* huart, uint16_t Size) {
+    // Validar que el objeto SAS serial exista
+	if (huart->Instance == USART1 ){
+			Serial->handleIdleIRQ(Size);
+		}
+
+	if (huart->Instance == USART2 ){
+		sas->onRxEvent(huart,Size);
+	}
+
+
+}

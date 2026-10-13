@@ -1,0 +1,333 @@
+/*
+ * StateMachine.h
+ *
+ *  Created on: Septiembre 1, 2026
+ *      Author: Saúl Luna Minor
+ *
+ */
+
+#ifndef SRC_STATEMACHINE_H_
+#define SRC_STATEMACHINE_H_
+
+#include "../Inc/main.h"
+#include "../JSON/CrearJson.h"
+#include "PuertoSerie.h"
+#include "../Src/VariablesGlobales.h"
+#include "../Src/PulseGenerator.h"
+#include "../Src/flags.h"
+#include "../SAS/SasEgm.h"
+
+// Alias de tipo para bytes crudos (antes '#define byte uint8_t').
+using byte = uint8_t;
+
+// ── Constantes de tiempo para TIM4, en TICKS del propio timer ──────────────
+// Con el prescaler configurado en main.cpp, TIM4 cuenta a 10 kHz, es decir
+// 10 ticks = 1 ms. Estas constantes se comparan contra
+// __HAL_TIM_GET_COUNTER(_htim4), NUNCA contra HAL_GetTick().
+constexpr uint32_t TIM_5s    = 50000;
+constexpr uint32_t TIM_3s    = 30000;
+constexpr uint32_t TIM_2s    = 20000;
+constexpr uint32_t TIM_1s    = 10000;
+constexpr uint32_t TIM_700ms = 7000;
+constexpr uint32_t TIM_500ms = 5000;
+constexpr uint32_t TIM_400ms = 4000;
+constexpr uint32_t TIM_350ms = 3500;
+constexpr uint32_t TIM_250ms = 2500;
+constexpr uint32_t TIM_150ms = 1500;
+constexpr uint32_t TIM_100ms = 1000;
+constexpr uint32_t TIM_80ms  = 800;
+constexpr uint32_t TIM_70ms  = 700;
+constexpr uint32_t TIM_60ms  = 600;
+constexpr uint32_t TIM_50ms  = 500;
+constexpr uint32_t TIM_40ms  = 400;
+constexpr uint32_t TIM_1ms   = 10;
+
+// ── Parámetros del proceso Cash Out, en MILISEGUNDOS REALES ────────────────
+// CashOut_Proceso() mide el tiempo con HAL_GetTick() (ms reales), no con
+// TIM4. Por eso estas constantes NO se derivan de los TIM_xxx de arriba
+// (antes sí lo hacían: CASHOUT_LINE_SETTLE_MS = TIM_40ms = 400 y
+// CASHOUT_RESPONSE_TIMEOUT = TIM_700ms = 7000, valores en "ticks de TIM4"
+// que habrían esperado 10 veces más de lo previsto si se usaban con
+// HAL_GetTick(). De hecho el .cpp nunca las usó: traía 200UL/2000UL sueltos).
+// Los valores de abajo son los que el código realmente aplica hoy.
+constexpr uint32_t CASHOUT_LINE_SETTLE_MS      = 200;
+constexpr uint32_t CASHOUT_RESPONSE_TIMEOUT_MS = 2000;
+// Reintentos tras el primer pulso sin respuesta (0 = sin reintentos).
+// Reservada para uso futuro: CashOut_Proceso() todavía no implementa
+// reintentos (ver TODO junto al estado SendingPulses en el .cpp).
+constexpr uint8_t CASHOUT_MAX_RETRIES = 3u;
+
+constexpr int MAX_PARPADEO_INICIAL = 6;
+
+constexpr int MEM_TEST_OFFSET = 59;   // Últimos 5 bytes dentro de los 64 leídos
+constexpr int MEM_TEST_SIZE   = 5;
+
+// Valores para el ADC:
+constexpr float VREF    = 3.3f;
+constexpr float ADC_RES = 4095.0f;
+
+constexpr uint32_t VREF_MV      = 3300;
+constexpr uint32_t V25_MV       = 1430;
+constexpr uint32_t AVG_SLOPE_MV = 43;   // 4.3 mV/°C ×10
+
+typedef enum {
+    RESET_UNKNOWN = 0,
+    RESET_POWERON,
+    RESET_PIN,
+    RESET_SOFTWARE,
+    RESET_IWDG,
+    RESET_WWDG,
+    RESET_LOWPOWER
+} ResetCause_t;
+
+enum class State {
+	Estado_Inicio,
+	Estado_Recepcion_Json,
+	Caida_de_Voltaje,
+	Estado_Reset_Meters_JSON,
+	Estado_Solicitud_de_Version,
+	Estado_Solicitud_de_Estado_Contadores,
+	Estado_Diagnostico_STM32,
+	Proceso_Cash_Out,
+	Proceso_Cash_In,
+    Fin_maquina,
+};
+
+enum class CashOutState {
+    Init,
+	Waitfirtspulse,
+    SendingPulses,
+    // VerifyEnd y Error: la lógica existe pero está deshabilitada en
+    // CashOut_Proceso() (bloque comentado). Mientras no se reactive
+    // formalmente, State_Cash_Out NUNCA debe tomar estos valores: el switch
+    // no tiene case activo para ellos y caería al `default`, dejando el
+    // Cash Out sin transición de salida.
+    VerifyEnd,
+    Error,
+    Finish
+};
+
+struct Signal {
+    // HW
+    volatile int* flag; 		 // Flag de interrupción
+    GPIO_TypeDef* gpio_port;	 // Puerto GPIO
+    uint16_t gpio_pin; 			// Pin GPIO
+
+    // Contadores
+    int* counter;              // Contador de pulsos instantaneo
+    int* contador_prg;		   // Contador de pulsos progresivo
+    uint8_t* contador_prg_A;   // Buffer contador progresivo
+
+    // FSM
+    uint32_t* timer_val;       // Tick de última lectura
+    int* evento_activo;		    // Evento activo
+    char* json_progre;             // JSON inicial
+
+    // Flash
+    uint8_t flash_offset;        // Offset en memoria flash
+
+    // Resultado
+    int* valor_actual;          // Valor calculado
+
+    // Timeout
+    uint32_t TimeOutMin;       // Tiempo mínimo para procesar evento
+    uint32_t TimeOutMax;      // Tiempo máximo para procesar evento
+
+    // JSON
+    EventoTipo evt;
+
+    Signal(volatile int* f,
+    		GPIO_TypeDef* p,
+			uint16_t pi,// Contadores
+
+    	    int* c,              // Contador de pulsos instantaneo
+    	    int* cp,		   // Contador de pulsos progresivo
+    	    uint8_t* cpA,   // Buffer contador progresivo
+
+    	    // FSM
+    	    uint32_t* t_val,       // Tick de última lectura
+    	    int* ev,		    // Evento activo
+			char* j_p,            // JSON inicial
+
+    	    // Flash
+    	    uint8_t flash,        // Offset en memoria flash
+
+    	    // Resultado
+    	    int* va,         // Valor calculado
+
+    	    // Timeout
+    	    uint32_t TMin,       // Tiempo mínimo para procesar evento
+    	    uint32_t TMax,      // Tiempo máximo para procesar evento
+
+    	    // JSON
+    	    EventoTipo evento ): flag(f), gpio_port(p), gpio_pin(pi),
+                    counter(c),  contador_prg(cp), contador_prg_A(cpA),
+              	  	timer_val(t_val),  evento_activo(ev), json_progre(j_p),
+					flash_offset(flash), valor_actual(va),  TimeOutMin(TMin),
+					TimeOutMax(TMax),    evt(evento){}
+
+          Signal() : flag(0), gpio_port(nullptr), gpio_pin(0),
+                    counter(0),  contador_prg(0), contador_prg_A(nullptr),
+              	  	timer_val(0),  evento_activo(0), json_progre(nullptr),
+					flash_offset(0), valor_actual(0),  TimeOutMin(0),
+					TimeOutMax(0),    evt(EventoTipo::None) {}
+};
+
+class StateMachine {
+
+public:
+
+	StateMachine();
+
+	void Asigna_Perifericos(
+			TIM_HandleTypeDef* timer4,
+			UART_HandleTypeDef* Serial_,
+			UART_HandleTypeDef* Serial_2,
+			IWDG_HandleTypeDef* Iwdg,
+			I2C_HandleTypeDef*  I2C_Memoria_externa,
+			ADC_HandleTypeDef* adc1,
+			PulseGenerator* PulseHopper);
+
+	void runStateMachine(volatile Flags &Obj_Flags );
+
+	// Deben llamarse desde los callbacks HAL correspondientes en main.cpp
+	// (ver Doxygen junto a cada definición en el .cpp).
+	void manejarInterrupcionTx(UART_HandleTypeDef* huart);
+	void manejarInterrupcionIdleRx(UART_HandleTypeDef* huart, uint16_t Size);
+
+
+private:
+
+	 State currentState;
+
+	 CashOutState State_Cash_Out;
+	 IWDG_HandleTypeDef *_hiwdg;
+	 UART_HandleTypeDef* huart_Serial;
+	 UART_HandleTypeDef* huart_Serial_SAS;
+	 TIM_HandleTypeDef *_htim4;
+	 PuertoSerie *Serial;
+	 I2C_HandleTypeDef *hi2c2;
+	 ADC_HandleTypeDef *hadc1;
+	 PulseGenerator *pulse;
+	 CrearJson *CrearJson_obj;
+	 VariablesGlobales *data = nullptr;   // referencia a la estructura compartida
+
+	 SasEgm* sas = SasEgm::getInstance();
+	 int Creditos_actuales = 0;
+	 uint16_t timer_val4 = 0;
+	 uint16_t timer_valLED = 0;
+
+	 uint32_t mv_real;     // milivolts reales (0–3300)   [reservado: ver bloque ADC comentado]
+	 uint32_t mv_equiv;    // milivolts equivalentes (0–12000) [reservado: ídem]
+
+	 //MODO DIAGNOSTICO
+	 int     decimal_test = 0;
+	 uint8_t mem_test_pattern[MEM_TEST_SIZE] = { 0x00, 0x00, 0x00, 0x00, 0x00 };
+	 uint8_t mem_test_read[MEM_TEST_SIZE];   // [reservado: usado solo en el bloque de verificación comentado]
+	 ResetCause_t g_reset_cause;
+
+     bool Flag_pago_pendiente = false;   // [reservado: ver CallbackCaida_Voltaje comentado]
+     int  Pago_pendiente = 0;            // [reservado: ídem]
+
+     int uart_buf_len;
+     char uart_buf[50];
+
+     char json_Sta_On[256];
+
+     byte buffer = 0;
+     uint8_t JSON_datos_recibidos[256] = {};
+     int Contador_EnviarJson = 0;
+     int Hopper_Valor_Anterior = 0;
+     int Creditos = 0;
+     int TiempoPulso_In = 0;   // Decodificado en Solicitud_Cash_In; ver TODO en CashIn_Proceso()
+
+
+     JsonData datosJson;
+
+	  int done = 0;
+
+	  uint32_t adc_value = 0;
+	  uint8_t Flag_parpadeo_inicial = 0;
+
+	  uint32_t tickInicio = 0;
+	  const uint32_t DELAY_INICIO_MS = 500;
+	  bool flag_DELAY_INICIO = false;
+
+	  int bandera_on = 0;
+
+	  uint32_t Star_Time = 0;
+	  Signal sig1;
+	  Signal sig2;
+	  Signal sig3;
+
+	  JsonData CrearJsonData( EventoTipo tipo_evt,  const char* estado);
+
+	  bool LeerMensajeSerial(uint8_t* buffer, size_t size);
+
+	  State ProcesarJsonRecibido( uint8_t* json_buffer);
+
+	  void InitMeters(volatile Flags &Obj_Flags);
+	  void InitSignals(volatile Flags& flags);
+
+	  uint16_t Detiene_Reinica_Timer(int CNT_Number);
+
+	  // Función interna para procesar una señal
+	  void ProcessSignal( Signal& sig, EventoTipo tipo_evt);
+
+	  // Helpers de lectura/escritura de contadores BCD en flash_data (evitan
+	  // repetir el mismo bucle de 5 bytes en InitMeters/ProcessSignal).
+	  int  ExtraerContadorDeFlash(uint8_t* destino, int offset);
+	  void GuardarContadorEnFlash(const uint8_t* origen, int offset);
+
+	  // Arma+envía un JSON de evento normal (ConstruirJson + Envio_datos_JSON),
+	  // reemplaza el bloque de 4 líneas que se repetía en varios estados.
+	  void EnviarEventoJSON(EventoTipo tipo, const char* estado);
+
+	  // Arma+envía un JSON de error ('o' = cash out, 'i' = cash in); reemplaza
+	  // la duplicación entre SendCashOutError()/ReportarErrorCashIn().
+	  void EnviarErrorEvento(char tipo);
+
+	  // Limpia el buffer de recepción JSON; reemplaza el
+	  // memset+buffer=0 repetido en cada case de ProcesarJsonRecibido().
+	  void LimpiarBufferJson();
+
+// Métodos privados para cada estado
+    State handleInicio( volatile Flags &Obj_Flags);
+    State handleRecepcionJson();
+    State ResetContadores();
+    State SolicitudFirmware();
+    State Estado_Contadores();
+    State Diagnostico_STM32();
+    State CashOut_Proceso();
+    State CashIn_Proceso();
+	State CallbackCaida_Voltaje();
+
+ // Métodos auxiliares
+	void limpiarFlags(volatile Flags &Obj_Flags);
+	void IniciarTimer();
+	void handleTimers();
+	void handleLedParpadeo();
+	void enviarEventoOn();
+	void procesarTodasLasSignales();
+
+	int16_t Leer_Temperatura_MCU_x10(void);
+
+	ResetCause_t Obtener_Causa_Reset(void);
+
+	const char* ResetCause_ToString(ResetCause_t cause);
+
+	void PulsoGeneral(GPIO_TypeDef* puerto, uint16_t pin, uint32_t tiempoPulso_ms);
+
+	// Envía JSON de error en Cash Out / Cash In (delegan en EnviarErrorEvento)
+	void SendCashOutError();
+	void ReportarErrorCashIn();
+
+    void Envio_datos_JSON();
+
+    void intToBCDArray(int num, byte *bcdArray);
+	int  BCDToDecimal(byte bcd);
+	int  BCDArrayToDecimal(byte bcdArray[], int size);
+
+};
+
+#endif /* SRC_STATEMACHINE_H_ */

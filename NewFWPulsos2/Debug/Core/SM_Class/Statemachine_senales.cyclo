@@ -1,0 +1,5 @@
+../Core/SM_Class/../SM_Class/StateMachine.h:139:5:Signal::Signal(volatile int*, GPIO_TypeDef*, uint16_t, int*, int*, uint8_t*, uint32_t*, int*, char*, uint8_t, int*, uint32_t, uint32_t, EventoTipo)	1
+../Core/SM_Class/Statemachine_senales.cpp:23:6:void StateMachine::InitMeters(volatile Flags&)	4
+../Core/SM_Class/Statemachine_senales.cpp:69:6:void StateMachine::InitSignals(volatile Flags&)	4
+../Core/SM_Class/Statemachine_senales.cpp:126:7:void StateMachine::ProcessSignal(Signal&, EventoTipo)	16
+../Core/SM_Class/Statemachine_senales.cpp:211:6:void StateMachine::procesarTodasLasSignales()	3

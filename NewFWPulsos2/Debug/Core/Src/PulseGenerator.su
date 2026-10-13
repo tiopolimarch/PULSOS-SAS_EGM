@@ -1,0 +1,6 @@
+../Core/Src/PulseGenerator.cpp:19:1:PulseGenerator::PulseGenerator()	16	static
+../Core/Src/PulseGenerator.cpp:31:17:static PulseGenerator& PulseGenerator::getInstance()	8	static
+../Core/Src/PulseGenerator.cpp:42:6:void PulseGenerator::init(TIM_HandleTypeDef*, GPIO_TypeDef*, uint16_t)	24	static
+../Core/Src/PulseGenerator.cpp:68:6:void PulseGenerator::start()	16	static
+../Core/Src/PulseGenerator.cpp:83:6:void PulseGenerator::stop()	16	static
+../Core/Src/PulseGenerator.cpp:99:6:void PulseGenerator::onTimerTick(TIM_HandleTypeDef*)	16	static

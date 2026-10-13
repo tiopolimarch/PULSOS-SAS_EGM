@@ -1,0 +1,282 @@
+/*
+ * SasReceiver.cpp
+ *
+ * Ver SasReceiver.h para las reglas de delimitacion de trama.
+ */
+
+#include "SasReceiver.h"
+#include <string.h>
+
+// ===========================================================================
+//  ARRANQUE
+// ===========================================================================
+void SasReceiver::begin(UART_HandleTypeDef* huart, uint8_t direccionEgm)
+{
+    huart_        = huart;
+    direccionEgm_ = direccionEgm;
+
+    dmaTail_      = 0;
+    ensambleLen_  = 0;
+    ensambleTick_ = 0;
+    colaHead_     = 0;
+    colaTail_     = 0;
+    txBusy_       = false;
+    rearmarRx_    = false;
+
+    statTramas_      = 0;
+    statColaLlena_   = 0;
+    statTxOcupado_   = 0;
+    statErrores_     = 0;
+    statIncompletas_ = 0;
+    statWakeup1_     = 0;
+    statWakeup0_     = 0;
+
+    armarRx();
+}
+
+void SasReceiver::armarRx()
+{
+    if (huart_ == nullptr) return;
+
+    HAL_UART_AbortReceive(huart_);
+
+    __HAL_UART_CLEAR_OREFLAG(huart_);
+    __HAL_UART_CLEAR_NEFLAG(huart_);
+    __HAL_UART_CLEAR_FEFLAG(huart_);
+    __HAL_UART_CLEAR_PEFLAG(huart_);
+    __HAL_UART_CLEAR_IDLEFLAG(huart_);
+    huart_->ErrorCode = HAL_UART_ERROR_NONE;
+
+    dmaTail_     = 0;
+    ensambleLen_ = 0;
+
+    // El buffer es de 16 bits porque el UART esta en 9 bits sin paridad:
+    // HAL escribe la palabra completa (9 bits) en cada half-word.
+    HAL_UARTEx_ReceiveToIdle_DMA(huart_,
+                                 reinterpret_cast<uint8_t*>(dmaRx_),
+                                 RX_DMA_WORDS);
+
+    // Apagamos el Half Transfer: solo agrega callbacks que no usamos.
+    if (huart_->hdmarx != nullptr) {
+        __HAL_DMA_DISABLE_IT(huart_->hdmarx, DMA_IT_HT);
+    }
+}
+
+// ===========================================================================
+//  LARGO DEL MENSAJE SEGUN EL PROTOCOLO
+//  Devuelve 0 mientras todavia no se pueda saber.
+// ===========================================================================
+uint16_t SasReceiver::largoEsperado() const
+{
+    if (ensambleLen_ == 0) return 0;
+
+    const uint8_t direccion = ensamble_[0];
+
+    // General poll: la direccion trae el bit 7 puesto (0x80 | addr).
+    // Es un mensaje de un solo byte, se puede despachar de inmediato.
+    if (direccion & 0x80) return 1;
+
+    // Long poll dirigido a otro EGM del bus: no nos interesa, pero hay que
+    // cerrarlo igual para no pegarlo con el siguiente mensaje.
+    // Aun asi necesitamos el comando para saber cuanto ocupa.
+    if (ensambleLen_ < 2) return 0;
+
+    const uint8_t comando = ensamble_[1];
+
+    // Comandos que traen byte de longitud:
+    //   direccion + comando + len + (len datos) + 2 de CRC
+    switch (comando) {
+        case 0x2E:   // send validation number
+        case 0x2F:   // send selected meters for game n
+        case 0x4C:   // set current date/time
+        case 0x4D:   // receive date/time
+        case 0x72:   // AFT transfer funds  <-- AGREGADO
+        case 0x7B:   // extended validation status
+        case 0xAF:   // extended meters
+        case 0xB0:   // multi-denom preamble
+            if (ensambleLen_ < 3) return 0;
+            return (uint16_t)(3 + ensamble_[2] + 2);
+        default:
+            break;
+    }
+
+    // Comandos con datos de largo FIJO: no traen byte de longitud, asi que
+    // hay que saberselos de memoria.
+    //
+    // Sin esta rama el 0xA0 se cerraba a los dos bytes y los cuatro que
+    // siguen -numero de juego y CRC- se quedaban sueltos, y el ensamblador
+    // los tomaba como el arranque de otra trama.  No rompia nada porque la
+    // direccion no cuadraba y se descartaban, pero la trama buena llegaba
+    // mutilada y era imposible validarle el CRC.
+    switch (comando) {
+        case 0xA0:   // send enabled features: + numero de juego (2) + CRC (2)
+            return 6;
+
+        // AFT lock and status request, tabla 8.2a:
+        //   direccion + comando + codigo de bloqueo + condicion +
+        //   timeout (2 BCD) + CRC (2) = 8 bytes.
+        //
+        // SIN ESTO NO HAY AFT.  El ensamblador cerraba el 0x74 a los dos
+        // bytes y los seis que siguen se quedaban sueltos, asi que nunca
+        // llegaba a leerse el codigo de bloqueo y era imposible saber si el
+        // host pedia bloquear, desbloquear o solo preguntar.
+        case 0x74:
+            return 8;
+
+        default:
+            break;
+    }
+
+    // El resto de los long polls que usamos son direccion + comando.
+    return 2;
+}
+
+// ===========================================================================
+//  RECEPCION  (contexto de ISR)
+// ===========================================================================
+void SasReceiver::onRxEvent(uint16_t size)
+{
+    // Normaliza la posicion: RX_DMA_WORDS equivale a la posicion 0.
+    // Sin esto, el while nunca terminaria cuando el DMA da la vuelta.
+    const uint16_t pos = static_cast<uint16_t>(size % RX_DMA_WORDS);
+
+    while (dmaTail_ != pos) {
+        const uint16_t palabra = dmaRx_[dmaTail_];
+        dmaTail_ = static_cast<uint16_t>((dmaTail_ + 1) % RX_DMA_WORDS);
+
+        if (palabra & BIT_WAKEUP) statWakeup1_++; else statWakeup0_++;
+
+        // El 9no bit marca inicio de mensaje. Si habia uno a medias, se perdio
+        // algun byte: lo publicamos igual (el despachador lo descartara por
+        // largo o por CRC) y arrancamos limpio.
+        if (palabra & BIT_WAKEUP) {
+            if (ensambleLen_ > 0) {
+                statIncompletas_++;
+                publicarTrama();
+            }
+            ensambleLen_  = 0;
+            ensambleTick_ = HAL_GetTick();
+        }
+
+        if (ensambleLen_ < MAX_TRAMA) {
+            ensamble_[ensambleLen_++] = static_cast<uint8_t>(palabra & MASCARA_DATO);
+        }
+
+        // Cierre estructural: en cuanto el mensaje esta completo segun SAS,
+        // se publica al instante. No se espera silencio ni timeout.
+        const uint16_t esperado = largoEsperado();
+        if (esperado > 0 && ensambleLen_ >= esperado) {
+            publicarTrama();
+        }
+    }
+}
+
+void SasReceiver::publicarTrama()
+{
+    if (ensambleLen_ == 0) return;
+
+    const uint8_t siguiente = static_cast<uint8_t>((colaHead_ + 1) % COLA_TRAMAS);
+
+    if (siguiente == colaTail_) {
+        // Cola llena: el main loop no esta drenando a tiempo.
+        // Se pierde la trama, pero no corrompemos las que ya estan en cola.
+        statColaLlena_++;
+    } else {
+        memcpy(cola_[colaHead_], ensamble_, ensambleLen_);
+        colaLen_[colaHead_]  = ensambleLen_;
+        colaTick_[colaHead_] = HAL_GetTick();
+        colaHead_ = siguiente;
+        statTramas_++;
+    }
+
+    ensambleLen_ = 0;
+}
+
+// ===========================================================================
+//  LECTURA  (contexto de main loop)
+// ===========================================================================
+uint16_t SasReceiver::readFrame(uint8_t* destino, uint16_t maxLen, uint32_t* edadMs)
+{
+    if (destino == nullptr)     return 0;
+    if (colaTail_ == colaHead_) return 0;   // no hay trama completa
+
+    uint16_t n = colaLen_[colaTail_];
+    if (n > maxLen) n = maxLen;
+
+    if (edadMs != nullptr) {
+        *edadMs = HAL_GetTick() - colaTick_[colaTail_];
+    }
+
+    memcpy(destino, cola_[colaTail_], n);
+    colaTail_ = static_cast<uint8_t>((colaTail_ + 1) % COLA_TRAMAS);
+
+    return n;
+}
+
+// ===========================================================================
+//  TRANSMISION
+// ===========================================================================
+bool SasReceiver::write(const uint8_t* datos, uint16_t largo)
+{
+    if (huart_ == nullptr || datos == nullptr) return false;
+    if (largo == 0 || largo > TX_MAX)          return false;
+
+    // Si el TX anterior sigue en curso NO pisamos el buffer: preferimos
+    // perder la respuesta (y contarla) antes que mandar una trama corrupta.
+    if (txBusy_ || huart_->gState != HAL_UART_STATE_READY) {
+        statTxOcupado_++;
+        return false;
+    }
+
+    // El EGM responde siempre con el 9no bit en 0.
+    for (uint16_t i = 0; i < largo; i++) {
+        txBuf_[i] = static_cast<uint16_t>(datos[i] & 0x00FF);
+    }
+
+    txBusy_ = true;
+
+    if (HAL_UART_Transmit_DMA(huart_,
+                              reinterpret_cast<uint8_t*>(txBuf_),
+                              largo) != HAL_OK) {
+        txBusy_ = false;
+        statTxOcupado_++;
+        return false;
+    }
+
+    return true;
+}
+
+void SasReceiver::onTxComplete()
+{
+    txBusy_ = false;
+}
+
+// ===========================================================================
+//  ERRORES Y MANTENIMIENTO
+// ===========================================================================
+void SasReceiver::onError()
+{
+    // Solo marcamos. El re-arme real se hace en service(), fuera de la ISR.
+    statErrores_++;
+    rearmarRx_ = true;
+}
+
+void SasReceiver::service()
+{
+    if (rearmarRx_) {
+        rearmarRx_ = false;
+        armarRx();
+        return;
+    }
+
+    // Mensaje a medias que nunca se completo (byte perdido, ruido): lo tiramos
+    // para que no se pegue con el siguiente y arme una trama monstruo.
+    if (ensambleLen_ > 0 && (HAL_GetTick() - ensambleTick_) > TIMEOUT_TRAMA_MS) {
+        __disable_irq();
+        if (ensambleLen_ > 0 && (HAL_GetTick() - ensambleTick_) > TIMEOUT_TRAMA_MS) {
+            ensambleLen_ = 0;
+            statIncompletas_++;
+        }
+        __enable_irq();
+    }
+}

@@ -1,0 +1,43 @@
+../Core/SAS/SasEgm.cpp:37:6:void SasEgm::servicio()	2
+../Core/SAS/SasEgm.cpp:57:9:static SasEgm* SasEgm::getInstance()	1
+../Core/SAS/SasEgm.cpp:73:18:SasInitResultado SasEgm::init(Serial9Bit*)	2
+../Core/SAS/SasEgm.cpp:84:6:void SasEgm::vincularContadores(const int*, const int*, const int*, const int*)	1
+../Core/SAS/SasEgm.cpp:99:10:static uint16_t SasEgm::calcularCrc16Kermit(const uint8_t*, uint16_t)	3
+../Core/SAS/SasEgm.cpp:111:6:bool SasEgm::enviarTramaSas(const uint8_t*, uint16_t)	4
+../Core/SAS/SasEgm.cpp:131:6:void SasEgm::responderContadorBCD(ComandoSas, uint64_t)	1
+../Core/SAS/SasEgm.cpp:158:6:void SasEgm::responderBloqueMedidores(ComandoSas, const uint64_t*, uint8_t)	4
+../Core/SAS/SasEgm.cpp:193:6:void SasEgm::responderAckSimple()	1
+../Core/SAS/SasEgm.cpp:203:6:static void SasEgm::bcdEncodeSas(uint8_t*, uint64_t, uint8_t)	6
+../Core/SAS/SasEgm.cpp:252:10:static uint64_t SasEgm::leerContador(const int*)	3
+../Core/SAS/SasEgm.cpp:271:10:uint32_t SasEgm::creditoActual() const	1
+../Core/SAS/SasEgm.cpp:275:6:bool SasEgm::hayHandpayPendiente() const	1
+../Core/SAS/SasEgm.cpp:278:10:bool SasEgm::juegoBloqueadoPorHost() const	3
+../Core/SAS/SasEgm.cpp:279:10:bool SasEgm::sonidoApagadoPorHost() const	1
+../Core/SAS/SasEgm.cpp:280:10:bool SasEgm::billeteroDeshabilitadoPorHost() const	1
+../Core/SAS/SasEgm.cpp:281:10:uint32_t SasEgm::billeteroDenominacionesPorHost() const	1
+../Core/SAS/SasEgm.cpp:293:6:void SasEgm::set_CurrentCredit(uint32_t)	3
+../Core/SAS/SasEgm.cpp:311:6:void SasEgm::set_Handpay(uint32_t)	4
+../Core/SAS/SasEgm.cpp:330:6:void SasEgm::set_Bet(uint32_t)	1
+../Core/SAS/SasEgm.cpp:340:6:void SasEgm::set_AftOut(uint32_t)	2
+../Core/SAS/SasEgm.cpp:350:6:void SasEgm::registrarCashOutLocal(uint32_t)	1
+../Core/SAS/SasEgm.cpp:362:6:static bool SasEgm::excEsPrioritaria(ExcepcionSas)	3
+../Core/SAS/SasEgm.cpp:374:6:void SasEgm::encolarExcepcionSas(ExcepcionSas)	12
+../Core/SAS/SasEgm.cpp:424:6:void SasEgm::actualizarCreditoPorPulsos()	12
+../Core/SAS/SasEgm.cpp:493:6:bool SasEgm::obtenerValorMedidorRuta(uint8_t, uint64_t*)	8
+../Core/SAS/SasEgm.cpp:569:10:uint64_t SasEgm::medidorSas(MedidorSas)	1
+../Core/SAS/SasEgm.cpp:590:9:static uint8_t SasEgm::tamanoMedidorSas(uint8_t)	5
+../Core/SAS/SasEgm.cpp:604:6:bool SasEgm::procesarComandoContadoresDetallados(const uint8_t*, uint16_t)	10
+../Core/SAS/SasEgm.cpp:702:6:static void SasEgm::copiarAsciiFijo(uint8_t*, const char*, uint8_t)	5
+../Core/SAS/SasEgm.cpp:726:6:void SasEgm::responderIdentidadMaquina()	1
+../Core/SAS/SasEgm.cpp:773:6:void SasEgm::responderHandpayInfo()	3
+../Core/SAS/SasEgm.cpp:835:6:void SasEgm::ProcesarComandoSAS(const uint8_t*, uint16_t)	45
+../Core/SAS/SasEgm.cpp:1209:6:void SasEgm::reiniciarEnsamblado()	1
+../Core/SAS/SasEgm.cpp:1223:6:void SasEgm::recibirPalabras()	7
+../Core/SAS/SasEgm.cpp:1256:10:uint16_t SasEgm::largoEsperado(bool*) const	29
+../Core/SAS/SasEgm.cpp:1346:6:void SasEgm::procesarPalabraRx(uint16_t, uint32_t)	9
+../Core/SAS/SasEgm.cpp:1379:6:void SasEgm::publicarTrama(bool, uint32_t)	3
+../Core/SAS/SasEgm.cpp:1409:10:uint16_t SasEgm::leerTramaDeCola(uint8_t*, uint16_t, uint32_t*, bool*, bool*)	7
+../Core/SAS/SasEgm.cpp:1432:6:void SasEgm::atenderSas()	16
+../Core/SAS/SasEgm.cpp:1552:6:bool SasEgm::enlaceArriba() const	1
+../Core/SAS/SasEgm.cpp:1557:6:void SasEgm::vigilarEnlace()	7
+../Core/SAS/SasEgm.cpp:1614:6:void SasEgm::reemitirExcepcionHandpay()	5

@@ -1,0 +1,10 @@
+../Core/SAS/SasReceiver.cpp:13:6:void SasReceiver::begin(UART_HandleTypeDef*, uint8_t)	1
+../Core/SAS/SasReceiver.cpp:37:6:void SasReceiver::armarRx()	3
+../Core/SAS/SasReceiver.cpp:69:10:uint16_t SasReceiver::largoEsperado() const	16
+../Core/SAS/SasReceiver.cpp:137:6:void SasReceiver::onRxEvent(uint16_t)	8
+../Core/SAS/SasReceiver.cpp:174:6:void SasReceiver::publicarTrama()	3
+../Core/SAS/SasReceiver.cpp:198:10:uint16_t SasReceiver::readFrame(uint8_t*, uint16_t, uint32_t*)	5
+../Core/SAS/SasReceiver.cpp:219:6:bool SasReceiver::write(const uint8_t*, uint16_t)	11
+../Core/SAS/SasReceiver.cpp:254:6:void SasReceiver::onTxComplete()	1
+../Core/SAS/SasReceiver.cpp:262:6:void SasReceiver::onError()	1
+../Core/SAS/SasReceiver.cpp:269:6:void SasReceiver::service()	8

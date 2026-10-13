@@ -1,0 +1,10 @@
+../Core/SAS/SerialPortSAS.cpp:12:6:virtual void SerialPortSAS::begin(UART_HandleTypeDef*, uint32_t)	1
+../Core/SAS/SerialPortSAS.cpp:28:9:virtual uint8_t SerialPortSAS::write(uint8_t*, uint16_t)	4
+../Core/SAS/SerialPortSAS.cpp:42:9:virtual int16_t SerialPortSAS::write(int16_t*, uint16_t)	1
+../Core/SAS/SerialPortSAS.cpp:43:9:virtual uint8_t SerialPortSAS::read(uint8_t*, uint16_t)	1
+../Core/SAS/SerialPortSAS.cpp:44:9:virtual int16_t SerialPortSAS::read(int16_t*, uint16_t)	1
+../Core/SAS/SerialPortSAS.cpp:46:6:virtual void SerialPortSAS::print(const char*, uint16_t)	1
+../Core/SAS/SerialPortSAS.cpp:48:6:void SerialPortSAS::onRxEvent(UART_HandleTypeDef*, uint16_t)	2
+../Core/SAS/SerialPortSAS.cpp:57:6:bool SerialPortSAS::write9bits(uint8_t*, uint16_t, bool)	5
+../Core/SAS/SerialPortSAS.cpp:73:10:uint16_t SerialPortSAS::readBytes(uint8_t*, uint16_t, uint32_t)	5
+../Core/SAS/SerialPortSAS.cpp:100:9:virtual uint8_t SerialPortSAS::available()	5

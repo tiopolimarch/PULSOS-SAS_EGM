@@ -1,0 +1,742 @@
+/*
+ * SasEgm.h
+ *
+ *  EL SAS LADO MAQUINA, COMO OBJETO.
+ *
+ *  Antes todo esto vivia dentro de StateMachine y el estado en variables
+ *  sueltas a nivel de archivo.  Funcionaba, pero para usarlo habia que ser
+ *  StateMachine: no habia forma de tomar el SAS y pasarlo a otro lado.
+ *
+ *  Ahora es una clase con instancia unica y se pide por puntero:
+ *
+ *      SasEgm* sas = SasEgm::getInstance();
+ *      sas->begin(&sasRx, data);
+ *      sas->servicio(enReposo);
+ *      uint32_t saldo = sas->creditoActual();
+ *
+ *  Mismo patron que GeneradorPulsos, para que se lea igual que el resto del
+ *  proyecto.
+ *
+ *  POR QUE INSTANCIA UNICA Y NO UN OBJETO CUALQUIERA.  Hay un solo bus SAS y
+ *  una sola contabilidad por placa.  Dos objetos SasEgm serian dos
+ *  contabilidades distintas contestandole al mismo host, y el dia que alguien
+ *  creara el segundo por descuido, los medidores empezarian a contradecirse
+ *  sin que nada marcara error.
+ *
+ *  Y POR QUE NO SON MIEMBROS DE StateMachine.  Porque agregar miembros
+ *  cambia sizeof(StateMachine), y con las compilaciones incrementales de
+ *  CubeIDE eso corrompe memoria: ya nos paso y la placa escupia bytes
+ *  sueltos.  Como clase aparte el problema no existe.
+ */
+
+#ifndef SRC_SASEGM_H_
+#define SRC_SASEGM_H_
+
+#include "main.h"
+//#include "VariablesGlobales.h"
+#include "SasReceiver.h"
+//#include "GeneradorPulsos.h"
+
+// En que punto de la secuencia de AFT vamos.
+enum class EstadoAft : uint8_t {
+	LIBRE = 0,      // 0xFF para el host
+	PENDIENTE,      // 0x40 - le dije que si, falta avisarle con el 6F
+	BLOQUEADO       // 0x00 - listo para recibir la transferencia
+};
+
+class SasEgm {
+public:
+	// ---------------------------------------------------------------------
+	//  LA INSTANCIA
+	// ---------------------------------------------------------------------
+	static SasEgm* getInstance();
+
+	// Se llama una vez al arrancar, antes de cualquier otra cosa.
+	//
+	//   huartSas  el UART ya configurado a 19200, NUEVE bits, sin paridad,
+	//             con DMA circular en RX y DMA en TX.
+	//   datos     la estructura de contadores de la placa.  El SAS no es
+	//             dueno de ella: solo lee cuatro campos.
+	//
+	// El receptor de 9 bits es INTERNO: el SAS lo crea, lo arranca y lo
+	// maneja.  Quien use este modulo no tiene que saber que existe.
+	void begin(UART_HandleTypeDef* huartSas, VariablesGlobales* datos);
+
+	// ---------------------------------------------------------------------
+	//  LA UNICA LLAMADA DEL LAZO
+	//
+	//  enReposo dice si la maquina esta libre.  El SAS no conoce los estados
+	//  de StateMachine ni tiene por que: solo necesita saber si puede correr
+	//  los modos de prueba sin atravesarse con algo que ya este pasando.
+	//
+	//  Devuelve true cuando la prueba de estres quiere un ciclo de pago.  Es
+	//  a proposito que el SAS no pueda cambiar el estado de la maquina por su
+	//  cuenta: PIDE, y quien manda decide.
+	// ---------------------------------------------------------------------
+	bool servicio(bool enReposo);
+
+	// ---------------------------------------------------------------------
+	//  MOVER MEDIDORES DESDE FUERA
+	//
+	//  La razon de ser del modulo: que el firmware pueda decirle al SAS que
+	//  entro o salio dinero.  Un get y tres sets, y nada mas.
+	// ---------------------------------------------------------------------
+	uint32_t creditoActual() const;             // saldo en creditos
+
+	void set_CurrentCredit(uint32_t creditos);  // saldo 0x1A, y sube el 0x0B
+	void set_Handpay(uint32_t creditos);        // pago a mano: 0x04 y 0x23
+	void set_Bet(uint32_t creditos);            // apuesta: 0x00
+
+	void reiniciarContabilidad();               // todo a cero
+
+	// Cash out propio de la placa, ya pagado (los pulsos del hopper YA
+	// salieron).  Si se apunta o no lo decide el modulo: la bandera
+	// CASHOUT_REFLEJA_EN_SAS es privada justo para que no haya un if que a
+	// quien integra se le pueda olvidar y acabe contando el pago dos veces.
+	void registrarCashOutLocal(uint32_t creditos);
+
+	// Las tres marcas del diagnostico del cash out remoto (medidor 0x18).
+	// Con nombre propio en vez de pasar constantes: no hay forma de
+	// equivocarse de codigo.
+	void diagJsonRecibido();
+	void diagJsonEsCashOut();
+	void diagCashOutFinish();
+
+	// Las dos interrupciones del UART.
+	void onTxComplete();
+	void onRxEvent(uint16_t size);
+
+private:
+	SasEgm() = default;
+
+	// No se copia ni se asigna: es la instancia unica.  Si alguien lo intenta,
+	// que falle al compilar y no en el piso del casino.
+	SasEgm(const SasEgm&)            = delete;
+	SasEgm& operator=(const SasEgm&) = delete;
+
+	// Buffer donde se arma la trama que llega.  Vive aqui porque es del
+	// motor: nadie mas lo mira.
+	uint8_t  bufferRecepcionSas_[260] = {};
+
+	// Cuando se atendio el ultimo comando del host.  Diagnostico.
+	uint32_t temporizadorUltimoSas_ = 0;
+
+	// ---------------------------------------------------------------------
+	//  PRIVADO A PARTIR DE AQUI
+	// ---------------------------------------------------------------------
+
+	// Solo lo llama el AFT, que vive dentro de esta misma clase.  Si fuera
+	// publico, alguien podria subir el medidor de transferencias sin que
+	// hubiera habido una transferencia.
+	void set_AftOut(uint32_t creditos);
+
+	// Las constantes que antes se asomaban.  Ya no hacen falta afuera:
+	// registrarCashOutLocal() y las tres diag*() se encargan.
+	static const bool    CASHOUT_REFLEJA_EN_SAS;
+	static const uint8_t DIAG_JSON_RECIBIDO;
+	static const uint8_t DIAG_JSON_ES_CASHOUT;
+	static const uint8_t DIAG_CASHOUT_FINISH;
+
+	void anotarDiagCashOut(uint8_t evento);
+
+	// El receptor de 9 bits con su DMA.  Es DEL SAS: aqui viven los buffers
+	// circulares y la cola de tramas.  Nadie mas lo toca.
+	SasReceiver rx_;
+
+	// Prestada en begin().  El SAS no es dueno de ella.
+	VariablesGlobales* data_ = nullptr;
+
+	// Para saber si begin() ya corrio.
+	bool iniciado_ = false;
+
+	// =========================================================================
+	// SAS EGM  -  lado maquina
+	// =========================================================================
+
+	// Nuestra direccion en el bus.  El poleo general que nos toca contestar es
+	// (DIRECCION_SAS | 0x80) = 0x81.  El 0x80 pelado NO se contesta: ese es el
+	// poleo de la direccion 0 y en SAS hace de ACUSE de la excepcion anterior.
+	// La maquina real del banco POG se comporta exactamente asi -contesta los
+	// 0x81 y calla en los 0x80-, comprobado en el log del 21/09.
+	//
+	// TODO: esto tiene que salir de la EEPROM.  En un piso real cada maquina
+	// lleva su propia direccion, de 1 a 127.
+	static const uint8_t DIRECCION_SAS = 0x01;
+
+	// Cuantos creditos vale un pulso.  Hoy en 1 para no inventar nada.
+	//
+	// El codigo anterior traia un "* 100" clavado en cada respuesta.  Eso es
+	// una denominacion disfrazada, y no es la misma en todas las maquinas: un
+	// pulso puede valer 1, 5 o 20 creditos.  TODO: leerlo de la EEPROM.
+	// =====================================================================
+	//  LA EQUIVALENCIA DE ESTA PLACA
+	//
+	//        1 PULSO  =  1 CREDITO  =  $1.00 USD
+	//
+	//  Aqui NO se trabaja en centavos.  Es importante tenerlo claro porque
+	//  el SAS permite las dos cosas y confundirlas mueve el punto decimal
+	//  dos lugares en la contabilidad del casino.
+	//
+	//  Como funciona: los medidores SAS NO viajan en dinero, viajan en
+	//  CREDITOS -"SAS accounting denom units", lo dice la tabla C-7-.  El
+	//  host toma el numero del medidor y lo multiplica por la DENOMINACION
+	//  que la maquina declara en el long poll 0x1F.  O sea que el dinero no
+	//  se manda: se declara una vez y el host hace la cuenta.
+	//
+	//  Por eso el 0x1A contesta 10 y eso YA son diez dolares.  No hay que
+	//  multiplicar por cien: multiplicar seria decirle al host que hay mil
+	//  creditos de un dolar cada uno, o sea mil dolares.
+	//
+	//  Las unicas excepciones son los medidores que la tabla C-7 marca
+	//  "(cents)" -el 0x0D al 0x10 y del 0x80 en adelante-, que son de
+	//  tickets y AFT y esta placa no contesta ninguno.
+	//
+	//  -Ojo: mi ConversorApp SI trabaja en centavos, multiplica todo por
+	//  100.  Son dos criterios distintos en dos proyectos distintos, y esta
+	//  bien mientras cada uno declare su denominacion.-
+	// =====================================================================
+	static const uint32_t SAS_CREDITOS_POR_PULSO = 1;
+
+	// Tope de medidores que aceptamos en una peticion 0x2F.
+	// Tope de medidores en una peticion 0x2F.
+	//
+	// No es un numero que yo escoja: la tabla 7.3b dice que el byte de largo
+	// vale de 0x02 a 0x3E, o sea 62 bytes como maximo despues de el.  De esos,
+	// 2 son el numero de juego, asi que quedan 60 para codigos de medidor.
+	// Una peticion mas larga que eso no es una peticion SAS valida.
+	//
+	// En la practica caben muchos menos en la RESPUESTA, porque ahi cada
+	// medidor ocupa su codigo mas su valor.  De eso se encarga el armador,
+	// que corta cuando el byte de largo se le acabaria.
+	static const uint8_t SAS_MAX_MEDIDORES = 60;
+
+	// Valor maximo del byte de largo del 0x2F, tabla 7.3b.
+	static const uint8_t SAS_2F_LARGO_MAX = 0x3E;
+
+	// =====================================================================
+	//  IDENTIDAD QUE REPORTO EN EL LONG POLL 0x54
+	//
+	//  El host pregunta que version de SAS hablo y cual es el numero de
+	//  serie de la maquina.  Los dos viajan en ASCII, no en BCD.
+	//
+	//  El numero de serie es el que el casino ve en su sistema, asi que
+	//  tiene que cuadrar con el que tengan dado de alta para esta placa.
+	//  TODO: sacarlo de la EEPROM en vez de tenerlo aqui, para no recompilar
+	//  por cada placa.
+	// =====================================================================
+	static const char* const SAS_VERSION_ASCII;   // "602" = SAS 6.02
+	static const char* const SERIE_MAQUINA;
+
+	// =====================================================================
+	//  IDENTIDAD QUE REPORTO EN EL LONG POLL 0x1F
+	//
+	//  Esta trama es de largo fijo, asi que tengo que llenar todos los
+	//  campos aunque no todos apliquen a una placa de pulsos.
+	//
+	//  La DENOMINACION ya esta definida: un pulso vale un dolar, asi que el
+	//  codigo es el 0x06 de la tabla C-4.  Este es el campo mas importante
+	//  de toda la trama: es el que le dice al host por cuanto multiplicar
+	//  cada medidor.  Si dijera 0x01 -un centavo-, el casino veria mi
+	//  contabilidad dividida entre cien.
+	//
+	//  *** SIGUEN POR CONFIRMAR LA APUESTA MAXIMA Y EL PORCENTAJE DE PAGO ***
+	//  Esos dos los define el casino o la jurisdiccion, no yo.  Los dejo en
+	//  cero hasta que me pasen los buenos: prefiero que se note que faltan a
+	//  inventar un numero que el host se crea.
+	// =====================================================================
+	static const char* const ID_JUEGO_ASCII;        // 2 caracteres
+	static const char* const ID_JUEGO_EXTRA_ASCII;  // 3 caracteres
+	static const char* const ID_PAYTABLE_ASCII;     // 6 caracteres
+	static const char* const PORCENTAJE_PAGO_ASCII; // 4 caracteres, sin punto
+
+	// 0x06 = 100 centavos = $1.00.  Tabla C-4 del SAS 6.02.
+	static const uint8_t CODIGO_DENOMINACION = 0x06;
+	static const uint8_t APUESTA_MAXIMA      = 0x00;   // POR CONFIRMAR
+	static const uint8_t GRUPO_PROGRESIVO    = 0x00;   // no hay progresivo
+	static const uint8_t OPCIONES_JUEGO_HI   = 0x00;
+	static const uint8_t OPCIONES_JUEGO_LO   = 0x00;
+
+	// =====================================================================
+	//  MODOS DE PRUEBA DEL SAS
+	//
+	//  Con estos la placa se inventa un cash in y un hand pay para poder
+	//  verificar el enlace sin tener la maquina enfrente.  Cada uno se
+	//  enciende por separado y los dos disparan una sola vez por arranque.
+	//
+	//  Son constantes de COMPILACION y no banderas de ejecucion.  Lo hago
+	//  asi porque estos modos mueven medidores de contabilidad: quiero que
+	//  encenderlos cueste editar, recompilar y flashear, y que no exista
+	//  forma de activarlos por accidente desde un comando, un JSON o un bit
+	//  de memoria que se corrompa.
+	//
+	//  LOS DOS VAN EN false PARA UNA PLACA QUE SALE A CAMPO.
+	// =====================================================================
+
+	// Pone el 0x1A en TEST_CREDITOS_MONTO y sube el 0x0B en la misma
+	// cantidad, como si hubiera entrado un billete.
+	//
+	// El monto va en CREDITOS, y un credito es un dolar: 10 aqui son diez
+	// dolares, y en el sniffer se leen como 10, no como 1000.
+	static const bool     TEST_CREDITOS_ACTIVO = true;
+	static const uint32_t TEST_CREDITOS_MONTO  = 200;
+	static const uint32_t TEST_CREDITOS_MS     = 10000;   // 10 s de poleo
+
+	// Paga TEST_HANDPAY_MONTO: sube el 0x23 y el 0x04, y deja el 0x1A en
+	// cero.  Va despues del de creditos para que en el sniffer se vea
+	// primero entrar el dinero y luego salir.
+	static const bool     TEST_HANDPAY_ACTIVO  = false;
+	static const uint32_t TEST_HANDPAY_MONTO   = 10;
+	static const uint32_t TEST_HANDPAY_MS      = 30000;   // 30 s de poleo
+
+	// Los dos relojes cuentan desde que la maquina llega al estado de
+	// reposo, no desde el encendido: antes de eso el enlace SAS no esta
+	// arriba y el host no veria el cambio.
+	void correrModosDePrueba(bool enReposo);
+
+	// =====================================================================
+	//  SIMULADOR DE PRUEBA DE ESTRES
+	//
+	//  Portado del que tengo en el ConversorApp, adaptado a esta placa.
+	//  Alterna cash in y cash out cada STRESS_PERIODO_MS, sin parar, hasta
+	//  que apague la placa.  Sirve para dejarlo horas corriendo y ver si el
+	//  enlace se cae, si algun medidor se desincroniza o si la contabilidad
+	//  deriva.
+	//
+	//  DIFERENCIA IMPORTANTE CON EL DEL CONVERSOR: alla el cash out se
+	//  simula con un ticket falso.  Aqui NO simulo nada: la fase de cash out
+	//  mete la maquina al estado Proceso_Cash_Out de verdad, o sea que corre
+	//  la misma FSM del hopper, saca los mismos pulsos y registra por el
+	//  mismo camino que cuando le pico CASH OUT en la pagina.
+	//
+	//  Eso lo vuelve util para el problema que traigo: si con el estres
+	//  prendido el tablero del 0x18 mueve "finish" y "handpay" pero deja
+	//  "serial" y "rcho" en cero, queda probado que todo lo que esta abajo
+	//  del JSON funciona, y que lo unico roto es que el mensaje de la pagina
+	//  no llega.
+	//
+	//  VA EN false PARA CAMPO.  Fabrica dinero cada cinco segundos.
+	// =====================================================================
+	static const bool     STRESS_ACTIVO      = false;
+	static const uint32_t STRESS_MONTO       = 222;      // creditos por ciclo
+	static const uint32_t STRESS_PERIODO_MS  = 5000;    // cash in / cash out
+
+	// Ademas de mover los medidores, saca pulsos fisicos por la entrada de
+	// monedas, como hace el del ConversorApp.  En el banco no sirve de nada
+	// -el lazo esta abierto y no regresan-, pero deja la prueba mas parecida
+	// a lo que pasa en una maquina de verdad.
+	static const bool     STRESS_CON_PULSOS  = true;
+
+	bool correrPruebaEstres(bool enReposo);
+
+	// =====================================================================
+	//  REEMISION DE LA EXCEPCION 0x51
+	//
+	//  Seccion 7.8.1: si el host no viene por el 0x1B dentro de los quince
+	//  segundos siguientes a la excepcion, hay que volver a mandarla, y
+	//  repetirla cada quince segundos mientras el hand pay siga en la cola.
+	//
+	//  Sin esto, un host que se perdio el aviso no se entera nunca de que
+	//  hay un pago trabado.  -En el ConversorApp lo tengo cada 3 segundos;
+	//  quince es lo que dice el manual y es lo que uso aqui.-
+	// =====================================================================
+	static const uint32_t SAS_REEMITIR_51_MS = 15000;
+	void reemitirExcepcionHandpay();
+
+	// Excepcion de billete aceptado.  Uso la GENERICA 0x4F a proposito: las
+	// especificas -0x47 un dolar, 0x48 cinco, 0x49 diez...- dicen de que
+	// denominacion fue el billete, y esta placa cuenta PULSOS, no billetes:
+	// no tiene forma de saberlo.  El manual lo contempla justo para este
+	// caso: "use this exception for all bills without a specific exception".
+	static const uint8_t SAS_EXC_BILLETE_ACEPTADO = 0x4F;
+
+	// =====================================================================
+	//  SETTERS DE MEDIDORES
+	//
+	//  Unica puerta para mover un medidor desde fuera.  Los usan los modos
+	//  de prueba, pero sirven igual para cualquier otra cosa que necesite
+	//  ajustar la contabilidad -un comando remoto, por ejemplo-.
+	//
+	//  El 0x02, el 0x04, el 0x0B y el 0x23 son PROGRESIVOS: los setters solo
+	//  suman, nunca restan.  El 0x1A es la excepcion, porque es un saldo y
+	//  no un acumulado.
+	// =====================================================================
+	// =====================================================================
+	//  EL CASH OUT REMOTO SE REFLEJA EN LOS MEDIDORES SAS
+	//
+	//  El cash out que mando desde la pagina pulsa la salida del hopper y ya.
+	//  Los medidores SAS no se enteran: el 0x04, el 0x23 y el 0x1A solo se
+	//  mueven cuando esos pulsos REGRESAN por la entrada del hopper, y en el
+	//  banco esa entrada no esta conectada a nada.
+	//
+	//  Con esto en true, al terminar el cash out registro el pago yo mismo,
+	//  sin esperar a que regrese nada.  Asi veo el ciclo completo en el
+	//  sniffer teniendo solo la placa.
+	//
+	//  *** OJO EN UNA MAQUINA REAL ***
+	//  Ahi la entrada del hopper SI esta conectada y los pulsos SI regresan,
+	//  o sea que el pago se contaria DOS VECES: una por los pulsos que
+	//  vuelven y otra por este registro.  En campo esto va en false.
+
+	// Lo que el jugador tiene ahora mismo.  Lo uso en el cash out para saber
+	// cuanto pagar: el comando remoto no trae cantidad, asi que se paga el
+	// saldo completo, que es lo que significa un cash out.
+
+
+	// Retiro por AFT.  Baja el saldo igual que un hand pay, pero mueve OTRO
+	// medidor: el 0x18, "transferencias electronicas al host".
+	//
+	// Son dos cosas distintas y el casino las tiene que poder separar.  El
+	// 0x04 son creditos cancelados: dinero que un ATENDIENTE saco a mano.
+	// Un retiro por AFT no lo toca ningun atendiente, viaja por el sistema.
+	// Meterlos en la misma casilla es perder la unica forma de saber si un
+	// pago lo hizo una persona o lo hizo el host.
+	//
+	// Y ademas NO levanta hand pay pendiente: no hay nadie esperando que le
+	// paguen en efectivo, asi que no se manda el 0x51 ni se llena el 0x1B.
+
+	// Corre en cada vuelta del lazo: pasa al saldo del 0x1A lo que se
+	// movieron los contadores de pulsos desde la vuelta anterior.
+	void actualizarCreditoPorPulsos();
+
+	// =====================================================================
+	//  REPORTE DE EXCEPCIONES EN EL POLEO GENERAL
+	//
+	//  Hoy la placa contesta SIEMPRE 0x00 -sin novedad- a los poleos
+	//  generales, y el host se entera de un hand pay solo porque ve bajar el
+	//  0x1A en el siguiente 0x2F.  Funciona, pero no es lo que dice el SAS:
+	//  un hand pay tiene que avisarse con la excepcion 0x51 para que el host
+	//  venga a leer el 0x1B.
+	//
+	//  Con esto en true se activa la cola de excepciones con su ACK/NACK
+	//  implicito -SAS 6.02, secciones 3.1 y 3.2-:
+	//
+	//    - una excepcion transmitida NO se da por entregada.  Queda "en
+	//      vuelo" hasta que el host acuse recibo, y el acuse es implicito:
+	//      nunca hay un byte de ACK.
+	//    - si el host REPITE el mismo poleo general es un NACK: no la
+	//      recibio bien y hay que mandar LA MISMA otra vez.  Si se borrara
+	//      al transmitir, el reintento contestaria 0x00 y el evento se
+	//      perderia para siempre.
+	//    - cualquier long poll a nosotros, o un poleo a otra direccion,
+	//      cuenta como acuse y ahi si se borra.
+	//
+	//  YA EN true.  Lo tuve apagado mientras no sabia como reaccionaba el
+	//  host, porque esto toca el camino del poleo general y ya me paso una
+	//  vez que un cambio ahi dejo el bus sordo.
+	//
+	//  Lo prendo porque mi ConversorApp lo hace y lo vi funcionar contra
+	//  este mismo host: contesto 51 a un poleo general, el host le pidio el
+	//  1B enseguida, y el siguiente poleo ya salio 00.
+	//
+	//      [COM13] 81        [COM8] 51      <- aviso de hand pay
+	//      [COM13] 01 1B     [COM8] 01 1B...  <- el host viene por el monto
+	//      [COM13] 81        [COM8] 00      <- acusado, ya no se repite
+	//
+	//  Y es INERTE mientras no haya un hand pay: sin excepcion encolada
+	//  contesta 00 a todo, exactamente igual que antes.  No puede romper el
+	//  enlace por si solo.
+	// =====================================================================
+	static const bool EXCEPCIONES_SAS_ACTIVO = true;
+
+	static const uint8_t SAS_EXC_HANDPAY_PENDIENTE = 0x51;
+	static const uint8_t SAS_EXC_HANDPAY_RESETEADO = 0x52;
+
+	// =====================================================================
+	//  DIAGNOSTICO DEL CASH OUT REMOTO, POR EL LONG POLL 0x18
+	//
+	//  Problema que esto resuelve: cuando le pico CASH OUT en la pagina y
+	//  los medidores no se mueven, NO tengo forma de saber donde se rompio
+	//  la cadena.  El sniffer del SAS no me sirve, porque atenderSas() corre
+	//  antes del switch de estados: el poleo se contesta igual ande donde
+	//  ande la maquina, asi que el log se ve identico haya o no haya cash
+	//  out.  A ojo es indistinguible.
+	//
+	//  Con esto en true, el long poll 0x18 -que de otro modo contesta cero-
+	//  devuelve cuatro contadores de dos digitos BCD cada uno:
+	//
+	//      01 18 <AA> <BB> <CC> <DD> <CRC>
+	//
+	//      AA = JSON que llegaron por el serial (de cualquier tipo)
+	//      BB = de esos, cuantos se reconocieron como "rcho" (cash out)
+	//      CC = cuantas veces el CashOut llego hasta Finish
+	//      DD = cuantas veces se llamo a set_Handpay
+	//
+	//  Se lee de corrido y dice sola donde se corto:
+	//
+	//      00 00 00 00 -> no llega NADA por el serial.  Mira el ESP/WT32,
+	//                     el cableado del UART1 o el servidor.
+	//      05 00 00 00 -> llegan JSON pero ninguno es "rcho".  El servidor
+	//                     esta mandando otra cosa.
+	//      05 01 00 00 -> se reconocio el cash out pero la maquina no llego
+	//                     a Finish: se quedo trabada en la FSM del hopper.
+	//      05 01 01 00 -> llego a Finish pero no registro.  Es que
+	//                     CASHOUT_REFLEJA_EN_SAS esta en false en lo que
+	//                     flasheaste.
+	//      05 01 01 01 -> la cadena entera corrio.  Si aun asi el medidor no
+	//                     se movio, es que el saldo ya estaba en cero.
+	//
+	//  Cada contador se queda en 99 y no vuelve a cero, para que no me
+	//  confunda un contador que dio la vuelta.
+	//
+	//  EN CAMPO VA EN false: ahi el 0x18 tiene que contestar el medidor de
+	//  verdad, que para esta placa es cero.
+	// =====================================================================
+	// APAGADO.  Ya dio su respuesta -leyo 18 01 00 04 04, o sea cuatro cash
+	// outs completos y CERO comandos "rcho" reconocidos- y ahora estorba:
+	// el host mapea el medidor 0x18 a su columna AFT_OUT, y ahi se veia un
+	// AFT_OUT de 10,004.04 que no existe.  Me equivoque al decir que nadie
+	// dependia de ese medidor.
+	//
+	// Para volver a usarlo: ponlo en true, lee el par 18 del 2F, y apagalo.
+	static const bool DIAG_CASHOUT_EN_0x18 = false;
+
+	// Eventos que cuenta el diagnostico de arriba.
+
+	// La llaman desde Statemachine_estados.cpp, que no alcanza las variables
+	// de archivo de StateMachine.cpp.
+
+	// Si una trama espero mas que esto en la cola, el host ya se canso.
+	// Contestar tarde es peor que no contestar: la respuesta se le cruza con
+	// su siguiente poleo y le rompe la trama buena.
+	static const uint32_t SAS_EDAD_MAXIMA_MS = 20;
+
+	// Diagnostico: se miran en el debugger para saber si el enlace vive.
+	uint32_t sasPoleosContestados_ = 0;
+	uint32_t sasTramasAtendidas_   = 0;
+	uint32_t sasCrcMalos_          = 0;
+
+	// Cuantas veces el host me pidio repetir una excepcion.  Si esto sube y
+	// sube, la excepcion no le esta llegando bien: mirar el enlace fisico
+	// antes que el codigo.
+	uint32_t sasNackImplicitos_    = 0;
+
+	void atenderSas();
+
+	// MODIFICADO: antes no recibia nada y usaba 'direccion' y 'bytesLeidos',
+	// que no estan declaradas en NINGUN lado del proyecto -o sea que el
+	// archivo no compilaba-.  Ahora la trama entra por argumento.
+	void ProcesarComandoSAS(const uint8_t* trama, uint16_t largoTrama);
+
+	bool procesarComandoContadoresDetallados(const uint8_t* trama, uint16_t largoTrama);
+
+	// Puente entre un codigo de medidor SAS y las variables de la placa.
+	// Es METODO, no funcion suelta: necesita 'data', y ademas una funcion
+	// libre no-static definida en un .h da "multiple definition" en el
+	// linker en cuanto dos .cpp incluyen el header.
+	bool obtenerValorMedidorRuta(uint8_t codigo, uint64_t* salida);
+
+	// Atajo del de arriba para cuando solo quiero el numero y no me importa
+	// si tiene fuente real: el que no tiene sale en cero.  Lo uso en los long
+	// polls de medidor suelto para que salgan del MISMO puente que el 0x2F.
+	uint64_t medidorSas(uint8_t codigo);
+
+	static void bcdEncodeSas(uint8_t* destino, uint64_t valor, uint8_t nBytes);
+
+	uint16_t calcularCrc16Kermit(const uint8_t* datos, uint16_t longitud);
+	bool enviarTramaSas(const uint8_t* payload, uint16_t longitud);
+	// Respuesta corta: direccion + comando + 4 BCD + CRC.
+	//
+	// Toma uint64_t, no uint32_t.  Todos los medidores tienen que salir del
+	// mismo tipo: si unos caminos multiplican en 32 bits y otros en 64, el
+	// MISMO medidor contesta numeros distintos segun por donde lo pregunten
+	// en cuanto el acumulado crece, y uno de los dos va para atras.
+	void responderContadorBCD(uint8_t comando, uint64_t valor);
+
+	// Arma una trama de medidores de largo fijo: direccion + comando +
+	// N medidores de 4 bytes BCD + CRC.  La usan el 0x0F y el 0x19, que solo
+	// se diferencian en cuantos medidores llevan.
+	void responderBloqueMedidores(uint8_t comando, const uint64_t* valores, uint8_t nValores);
+
+	// 0x1F: identidad de la maquina.  Mezcla ASCII y binario, por eso no usa
+	// el helper de arriba.
+	void responderIdentidadMaquina();
+
+	// =====================================================================
+	//  EL MONTO DEL 0x1B VA EN CENTAVOS  (parche de compatibilidad)
+	//
+	//  El manual dice que el monto del 0x1B va en unidades de la
+	//  denominacion -creditos-, y eso es lo que yo mandaba: 10.
+	//
+	//  Pero mi host divide ese campo entre 100 antes de mandarlo al
+	//  servidor.  Comprobado en el log: cuando el 1B reporto 50, la pantalla
+	//  del host imprimio "SEND HP TO SERVER: 0.5".  Por eso un pago de diez
+	//  dolares aparecia en la pagina como $0,10.
+	//
+	//  Mi ConversorApp no tiene el problema porque el manda el monto en
+	//  centavos -handpayMonto = creditos * 100- y ahi los dos /100 y *100 se
+	//  cancelan.  Con esto en true la placa de pulsos hace lo mismo y queda
+	//  alineada con el resto de la flota.
+	//
+	//  *** ESTO ES UN PARCHE, NO LA SOLUCION ***
+	//  Lo correcto es que el host lea la denominacion del 0x1F -que esta
+	//  placa ya declara- en vez de tener el factor clavado.  EL DIA QUE
+	//  ARREGLES EL HOST, ESTO SE PONE EN false, o el monto se ira multiplicado
+	//  por cien.
+	//
+	//  OJO: toca SOLO el campo de monto del 0x1B.  Los medidores siguen en
+	//  creditos, porque el host los divide entre DENOMINACION -que trae un 5
+	//  clavado- y no entre 100: mandarlos en centavos no los arregla, los
+	//  empeora.  El 0x1A pasaria de 10/5=2 a 1000/5=200.
+	// =====================================================================
+	static const bool HANDPAY_1B_EN_CENTAVOS = true;
+	static const uint32_t CENTAVOS_POR_CREDITO = 100;   // 1 credito = $1.00
+
+	// =====================================================================
+	//  AFT  -  TRANSFERENCIA ELECTRONICA DE FONDOS  (seccion 8 del SAS 6.02)
+	//
+	//  POR QUE ESTA ESTO AQUI.  Durante dias busque por que el cash out de
+	//  la pagina no movia nada.  El tablero del 0x18 decia que ningun JSON
+	//  "rcho" llegaba nunca, y el 23/09 el sniffer lo explico: mi host NO
+	//  manda un JSON para el cash out remoto.  Manda AFT.
+	//
+	//      [COM13] 01 74 00 03 10 00 3D 46    <- pide bloqueo
+	//      [COM8]  (nada)                     <- la placa no sabia contestar
+	//      ...once veces, y se rindio.
+	//
+	//  La secuencia completa que mi host tiene programada:
+	//
+	//      1. 01 74 00 <cond> <timeout>   pedir bloqueo
+	//         -> contesto 40 bytes con el estado en 0x40 -bloqueo pendiente-
+	//         -> y encolo la excepcion 0x6F -juego bloqueado-
+	//      2. 01 72 ... tipo 80 ...       "sacame todo"
+	//         -> pago, contesto cuanto saque
+	//         -> y encolo la excepcion 0x69 -transferencia completa-
+	//      3. 01 74 80 00 00 00           desbloquear
+	//         -> contesto 40 bytes con el estado en 0xFF
+	//
+	//  SOLO IMPLEMENTO EL RETIRO -tipo 0x80, de la maquina al host-.  Es lo
+	//  unico que esta placa puede hacer de verdad: sabe cuanto credito hay y
+	//  sabe pagarlo pulsando el hopper.  Una carga -tipo 0x00- se rechaza
+	//  con su codigo de error, no se finge.
+	//
+	//  LOS MONTOS DE AFT VAN EN CENTAVOS.  Lo dicen las tablas 8.2b y 8.3a
+	//  con esas palabras: "in cents".  Aqui un credito es un dolar, asi que
+	//  se multiplica por cien.
+	// =====================================================================
+	static const bool AFT_ACTIVO = true;
+
+	// Numero de activo de la maquina.  Mi host lo manda como 01 00 00 00 en
+	// su trama de transferencia -byte bajo primero-, o sea el 1.  Si el
+	// casino da de alta la placa con otro, se cambia aqui.
+	static const uint32_t NUMERO_ACTIVO = 1;
+
+	// Cuanto aguanta el bloqueo sin que el host mande la transferencia.  Si
+	// se vence, la placa se desbloquea sola: un bloqueo eterno deja la
+	// maquina muerta si el host se cae a la mitad.
+	static const uint32_t AFT_TIMEOUT_BLOQUEO_MS = 15000;
+
+	// Excepciones de AFT.  Las dos son PRIORITARIAS en la tabla del manual,
+	// igual que el 0x51: llevan dinero detras.
+	static const uint8_t SAS_EXC_JUEGO_BLOQUEADO   = 0x6F;
+	static const uint8_t SAS_EXC_AFT_COMPLETA      = 0x69;
+
+	// =====================================================================
+	//  MONTO CANARIO EN EL 0x72  (sonda de escala, solo banco)
+	//
+	//  Con esto en true, la respuesta de la transferencia reporta SIEMPRE
+	//  AFT_MONTO_CANARIO centavos, sin importar cuanto credito haya.
+	//
+	//  PARA QUE SIRVE.  Hoy no se si el host toma el monto del campo del
+	//  0x72 o lo saca del medidor de creditos: con la maquina en 200 y una
+	//  transferencia de 200, los dos caminos dan el mismo numero y no hay
+	//  forma de distinguirlos.  Dejando el credito en CERO y reportando un
+	//  valor inventado, si ese valor aparece en la pantalla del host solo
+	//  pudo venir del 0x72.
+	//
+	//  POR QUE 888 Y NO 1000.  Porque 888 no se divide limpio por nada de
+	//  lo que puede estar pasando, y el decimal delata el factor:
+	//
+	//      tal cual   -> 888        1000 -> 1000
+	//      / 100      -> 8.88       1000 ->   10
+	//      / 5        -> 177.6      1000 ->  200
+	//      / 10       -> 88.8       1000 ->  100
+	//
+	//  Con 1000 todos los resultados son redondos y creibles, y uno no sabe
+	//  si le dividieron o no.  Con 888 cualquier division deja decimales.
+	//
+	//  NO MUEVE NINGUN MEDIDOR.  Es a proposito: reportar un monto que no
+	//  existe ya es bastante; si ademas moviera el 0x18 me quedaria dinero
+	//  fantasma en la contabilidad.  Es una sonda de protocolo, nada mas.
+	//
+	//  VA EN false PARA CUALQUIER COSA QUE NO SEA ESTA PRUEBA.
+	// =====================================================================
+	static const bool     AFT_MONTO_CANARIO_ACTIVO = false;
+	static const uint32_t AFT_MONTO_CANARIO        = 888;   // en CENTAVOS
+
+	// =====================================================================
+	//  VIGILANCIA DEL ENLACE  -  que hacer cuando el host se apaga
+	//
+	//  SAS es estrictamente pregunta-respuesta: el EGM nunca habla solo.
+	//  Aqui hay dos cosas distintas y conviene no confundirlas.
+	//
+	//  1) LO QUE SIEMPRE SE HACE, este la bandera como este.  Si el host
+	//     deja de polear, la placa se da cuenta y limpia lo que quedo a
+	//     medias: suelta el bloqueo de AFT y tira la excepcion que estaba
+	//     "en vuelo".  El manual lo pide -seccion 8.2, una maquina que
+	//     entra en link down estando bloqueada tiene que soltarse- y ademas
+	//     evita que al volver el host reciba el eco de una conversacion
+	//     vieja.  Lo que si se conserva es la excepcion PENDIENTE: si hubo
+	//     un hand pay mientras el host no estaba, se le cuenta al volver.
+	//
+	//  2) EL LATIDO, que es opcional y va en la bandera.  Con el enlace
+	//     caido la placa manda un byte cada LATIDO_PERIODO_MS.
+	//
+	//  *** OJO CON EL LATIDO EN UNA MAQUINA DE VERDAD ***
+	//  El bus SAS es multipunto: varios EGM colgados del mismo par.  Un EGM
+	//  que transmite sin que le pregunten SE ATRAVIESA con la respuesta de
+	//  otro y se la corrompe.  En el banco, con una sola placa, no pasa
+	//  nada.  En una ruta con varias maquinas, esto rompe el bus de los
+	//  demas.
+	//
+	//  Por eso va en false por defecto y por eso lo dejo escrito aqui.  Si
+	//  la idea es que el host sepa que la placa sigue viva, la forma que
+	//  contempla el protocolo es que el host polee y saque su conclusion
+	//  del silencio, no que la maquina grite.
+	// =====================================================================
+	static const bool     LATIDO_ENLACE_ACTIVO = false;
+	static const uint8_t  LATIDO_BYTE          = 0x01;
+	static const uint32_t LATIDO_PERIODO_MS    = 1000;
+
+	// Cuanto silencio hay que aguantar antes de dar el enlace por caido.
+	//
+	// Estaba en 2000 y el log del 24/09 demostro que era poco: despues de
+	// una transferencia AFT el host se calla 2,501 ms procesando, y la placa
+	// lo tomaba como host caido.  Ahi no paso nada porque el bloqueo ya se
+	// habia soltado solo, pero con el latido encendido la placa se habria
+	// puesto a hablar justo en medio de una pausa normal.
+	//
+	// Cinco segundos son mas de veinte poleos perdidos a su cadencia de
+	// ~230 ms.  Eso ya no es una pausa: es un host que se fue.
+	static const uint32_t ENLACE_TIMEOUT_MS    = 5000;
+
+
+	void vigilarEnlace();
+	bool enlaceArriba() const;
+
+	void responderAftLockStatus(const uint8_t* trama, uint16_t largoTrama);
+	void responderAftTransfer(const uint8_t* trama, uint16_t largoTrama);
+	void armarRespuestaAft(uint8_t estado, uint8_t tipo, uint64_t centavos);
+	void vigilarBloqueoAft();
+
+	// La llama la vigilancia del enlace cuando el host desaparece.  Vive en
+	// Statemachine_aft.cpp, que es donde esta el estado del bloqueo.
+	void liberarBloqueoAft();
+
+	// El estado del hand pay vive a nivel de archivo en StateMachine.cpp y
+	// el AFT esta en otro .cpp, asi que necesita esta puerta para mirarlo.
+	bool hayHandpayPendiente() const;
+
+	// 0x1B: informacion del hand pay pendiente.  Trama de 24 bytes.
+	void responderHandpayInfo();
+
+	// ACK de los long polls que no devuelven datos: se contesta UN byte, la
+	// propia direccion.  El NACK seria esa misma direccion con el bit 7
+	// puesto, pero no lo uso: si algo no me cuadra prefiero callar.
+	void responderAckSimple();
+
+	// Mete una excepcion en la cola para que salga en el proximo poleo
+	// general.  Solo hace algo si EXCEPCIONES_SAS_ACTIVO esta en true.
+	void encolarExcepcionSas(uint8_t codigo);
+};
+
+#endif /* SRC_SASEGM_H_ */

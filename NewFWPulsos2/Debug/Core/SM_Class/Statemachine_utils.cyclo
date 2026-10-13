@@ -1,0 +1,13 @@
+../Core/SM_Class/Statemachine_utils.cpp:23:6:void StateMachine::intToBCDArray(int, byte*)	3
+../Core/SM_Class/Statemachine_utils.cpp:51:5:int StateMachine::BCDToDecimal(byte)	1
+../Core/SM_Class/Statemachine_utils.cpp:62:6:int StateMachine::BCDArrayToDecimal(byte*, int)	2
+../Core/SM_Class/Statemachine_utils.cpp:71:6:bool StateMachine::LeerMensajeSerial(uint8_t*, size_t)	4
+../Core/SM_Class/Statemachine_utils.cpp:81:10:uint16_t StateMachine::Detiene_Reinica_Timer(int)	2
+../Core/SM_Class/Statemachine_utils.cpp:96:6:void StateMachine::limpiarFlags(volatile Flags&)	1
+../Core/SM_Class/Statemachine_utils.cpp:106:6:void StateMachine::IniciarTimer()	2
+../Core/SM_Class/Statemachine_utils.cpp:115:6:void StateMachine::handleTimers()	6
+../Core/SM_Class/Statemachine_utils.cpp:142:6:void StateMachine::handleLedParpadeo()	2
+../Core/SM_Class/Statemachine_utils.cpp:151:9:int16_t StateMachine::Leer_Temperatura_MCU_x10()	1
+../Core/SM_Class/Statemachine_utils.cpp:189:14:ResetCause_t StateMachine::Obtener_Causa_Reset()	7
+../Core/SM_Class/Statemachine_utils.cpp:208:13:const char* StateMachine::ResetCause_ToString(ResetCause_t)	7
+../Core/SM_Class/Statemachine_utils.cpp:224:6:void StateMachine::PulsoGeneral(GPIO_TypeDef*, uint16_t, uint32_t)	1

@@ -1,0 +1,13 @@
+../Core/SAS/Serial9BitStm32.cpp:12:6:void Serial9BitStm32::init(UART_HandleTypeDef*)	2
+../Core/SAS/Serial9BitStm32.cpp:27:6:void Serial9BitStm32::armarRx()	3
+../Core/SAS/Serial9BitStm32.cpp:62:6:void Serial9BitStm32::manejarRxEvent(uint16_t)	3
+../Core/SAS/Serial9BitStm32.cpp:80:6:void Serial9BitStm32::anotarPalabras(uint16_t, uint32_t)	2
+../Core/SAS/Serial9BitStm32.cpp:93:6:void Serial9BitStm32::rescatarPendientes()	3
+../Core/SAS/Serial9BitStm32.cpp:119:8:virtual size_t Serial9BitStm32::available9bit()	4
+../Core/SAS/Serial9BitStm32.cpp:141:8:virtual size_t Serial9BitStm32::readBuffer9bit(uint8_t*, size_t, uint32_t*)	8
+../Core/SAS/Serial9BitStm32.cpp:176:6:bool Serial9BitStm32::puedeTransmitir()	4
+../Core/SAS/Serial9BitStm32.cpp:187:8:size_t Serial9BitStm32::iniciarTx(uint16_t)	3
+../Core/SAS/Serial9BitStm32.cpp:208:8:virtual size_t Serial9BitStm32::write9bit(const uint16_t*, size_t)	7
+../Core/SAS/Serial9BitStm32.cpp:221:6:virtual void Serial9BitStm32::flush9bit()	4
+../Core/SAS/Serial9BitStm32.cpp:231:6:void Serial9BitStm32::manejarTxCompleto()	1
+../Core/SAS/Serial9BitStm32.cpp:237:6:void Serial9BitStm32::manejarError()	1

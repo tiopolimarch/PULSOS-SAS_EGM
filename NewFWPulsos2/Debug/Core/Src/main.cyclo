@@ -1,0 +1,20 @@
+../Core/Src/main.cpp:94:5:int main()	1
+../Core/Src/main.cpp:159:6:void SystemClock_Config()	4
+../Core/Src/main.cpp:208:13:void MX_ADC1_Init()	3
+../Core/Src/main.cpp:255:13:void MX_I2C2_Init()	2
+../Core/Src/main.cpp:289:13:void MX_IWDG_Init()	2
+../Core/Src/main.cpp:317:13:void MX_TIM2_Init()	4
+../Core/Src/main.cpp:362:13:void MX_TIM4_Init()	4
+../Core/Src/main.cpp:407:13:void MX_USART1_UART_Init()	2
+../Core/Src/main.cpp:440:13:void MX_USART2_UART_Init()	2
+../Core/Src/main.cpp:472:13:void MX_DMA_Init()	1
+../Core/Src/main.cpp:500:13:void MX_GPIO_Init()	1
+../Core/Src/main.cpp:577:6:void HAL_GPIO_EXTI_Callback(uint16_t)	6
+../Core/Src/main.cpp:608:6:void HAL_UART_TxCpltCallback(UART_HandleTypeDef*)	1
+../Core/Src/main.cpp:613:6:void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef*, uint16_t)	1
+../Core/Src/main.cpp:626:17:void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef*)	1
+../Core/Src/main.cpp:647:6:void Error_Handler()	1
+../Core/Src/main.cpp:656:1:void __static_initialization_and_destruction_0()	1
+../Core/Src/main.cpp:656:1:void __static_initialization_and_destruction_1()	1
+../Core/Src/main.cpp:656:1:cpp)	1
+../Core/Src/main.cpp:656:1:cpp)	1

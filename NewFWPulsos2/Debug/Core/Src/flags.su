@@ -1,0 +1,3 @@
+../Core/Src/flags.cpp:10:1:Flags::Flags(int, int, int, int, int, int)	24	static
+../Core/Src/flags.cpp:18:1:Flags::~Flags()	16	static
+../Core/Src/flags.cpp:18:1:virtual Flags::~Flags()	16	static

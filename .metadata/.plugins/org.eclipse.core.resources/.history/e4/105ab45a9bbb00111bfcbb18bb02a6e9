@@ -1,0 +1,1376 @@
+/*
+ * SasEgm.cpp
+ *
+ *  EL MOTOR SAS COMPLETO.  Todo lo que habla el protocolo vive aqui.
+ *
+ *  Que hay adentro:
+ *     - el CRC y el codificador BCD
+ *     - los armadores de trama y el despachador de long polls
+ *     - la atencion del bus y la cola de excepciones
+ *     - la contabilidad: el saldo, los ajustes y el puente a los medidores
+ *     - la vigilancia del enlace
+ *
+ *  Lo unico del SAS que NO esta aqui es el AFT, que tiene su propio archivo
+ *  -SasEgm_aft.cpp- porque es una pieza que se entiende sola.
+ */
+
+#include "SasEgm.h"
+
+// =========================================================================
+//  LA UNICA LLAMADA DEL LAZO
+//
+//  El orden importa:
+//
+//    1. service()     re-arma el DMA si hubo error y limpia tramas a medias
+//    2. atenderSas()  saca lo que llego y contesta
+//    3. el saldo sigue a los pulsos fisicos (si se vincularon contadores)
+//    4. reintentos, timeouts y vigilancia del enlace
+// =========================================================================
+void SasEgm::servicio() {
+    if (!iniciado_) return;   // begin() no corrio o fallo
+
+    rx_.service();
+    atenderSas();
+
+    actualizarCreditoPorPulsos();
+    reemitirExcepcionHandpay();
+    vigilarBloqueoAft();
+    vigilarEnlace();
+}
+
+// ---------------------------------------------------------------------------
+//  LA INSTANCIA UNICA
+//
+//  Estatica de funcion y no global: asi se construye la primera vez que
+//  alguien la pide y no antes.  En un arranque de STM32 eso importa, porque
+//  el orden en que se construyen las globales entre archivos no esta definido
+//  y una que dependa de otra puede encontrarsela a medio hacer.
+// ---------------------------------------------------------------------------
+SasEgm* SasEgm::getInstance() {
+    static SasEgm unica;
+    return &unica;
+}
+
+// ---------------------------------------------------------------------------
+//  ARRANQUE
+//
+//  Antes de armar el DMA se revisa la configuracion del UART.  Cada uno de
+//  estos errores hace que el SAS "no funcione" sin ningun otro sintoma, asi
+//  que se detectan aqui y se devuelven con nombre.  Si begin() no devuelve
+//  OK, el SAS no arranca y servicio() no hace nada.
+// ---------------------------------------------------------------------------
+SasBeginResultado SasEgm::begin(UART_HandleTypeDef* huartSas) {
+    iniciado_ = false;
+
+    if (huartSas == nullptr)                              return SasBeginResultado::SIN_UART;
+
+    // El noveno bit es el de wakeup: con 8 bits no se sabe donde empieza
+    // una trama.
+    if (huartSas->Init.WordLength != UART_WORDLENGTH_9B)  return SasBeginResultado::NO_ES_9_BITS;
+    if (huartSas->Init.Parity     != UART_PARITY_NONE)    return SasBeginResultado::CON_PARIDAD;
+
+    // Sin DMA de RX (o sin el __HAL_LINKDMA en el MspInit) el HAL truena.
+    if (huartSas->hdmarx == nullptr)                      return SasBeginResultado::SIN_DMA_RX;
+
+    // Normal en vez de circular: el DMA se para al llenarse y el enlace muere
+    // en silencio a los pocos segundos.
+    if (huartSas->hdmarx->Init.Mode != DMA_CIRCULAR)      return SasBeginResultado::DMA_RX_NO_CIRCULAR;
+
+    // Byte en vez de halfword: el noveno bit se pierde.
+    if (huartSas->hdmarx->Init.MemDataAlignment != DMA_MDATAALIGN_HALFWORD)
+                                                          return SasBeginResultado::DMA_RX_NO_HALFWORD;
+
+    huart_ = huartSas;
+
+    // El receptor arranca aqui con nuestra direccion de bus.  A partir de
+    // este momento el DMA esta armado y el SAS ya contesta poleos.
+    rx_.begin(huartSas, DIRECCION_SAS);
+    iniciado_ = true;
+
+    HAL_UART_Transmit(huart_, (uint8_t*)"sasOK", 5, -1);
+    return SasBeginResultado::OK;
+}
+
+void SasEgm::vincularContadores(const int* billIn, const int* apostado,
+                                const int* cashOut, const int* handpay) {
+    pBillIn_   = billIn;
+    pApostado_ = apostado;
+    pCashOut_  = cashOut;
+    pHandpay_  = handpay;
+}
+
+// ---------------------------------------------------------------------------
+//  INTERRUPCIONES
+//
+//  Se les pasa el huart tal cual llega al callback del HAL.  Si no es el
+//  UART del SAS no hacen nada, asi quien integra no tiene que escribir el if.
+// ---------------------------------------------------------------------------
+void SasEgm::onTxComplete(UART_HandleTypeDef* huart) {
+    if (huart_ != nullptr && huart == huart_) rx_.onTxComplete();
+}
+
+void SasEgm::onRxEvent(UART_HandleTypeDef* huart, uint16_t size) {
+    if (huart_ != nullptr && huart == huart_) rx_.onRxEvent(size);
+}
+
+// Sin esto, un solo error de linea -ruido, overrun- detiene el DMA de RX y
+// el enlace muere para siempre.  Solo se marca; el re-arme lo hace servicio().
+void SasEgm::onError(UART_HandleTypeDef* huart) {
+    if (huart_ != nullptr && huart == huart_) rx_.onError();
+}
+
+// =========================================================================
+// FUNCIONES DE APOYO PARA SAS
+// =========================================================================
+
+uint16_t SasEgm::calcularCrc16Kermit(const uint8_t* datos, uint16_t longitud) {
+	uint16_t crc = 0x0000;
+	for (uint16_t i = 0; i < longitud; i++) {
+		crc ^= datos[i];
+		for (uint8_t bit = 0; bit < 8; bit++) {
+			crc = (crc & 1) ? (crc >> 1) ^ 0x8408 : crc >> 1;
+		}
+	}
+	return crc;
+}
+
+bool SasEgm::enviarTramaSas(const uint8_t* payload, uint16_t longitud) {
+	if (longitud > 250) return false;
+	return rx_.write(payload, longitud);
+}
+
+// Respuesta corta: direccion + comando + 4 bytes BCD + CRC = 8 bytes.
+// Es el formato que contesta la maquina real:  01 1A 96 94 06 99 16 EE
+//
+// El codificador BCD es el MISMO que usa el 0x2F -bcdEncodeSas-.  Antes
+// habia dos bucles distintos haciendo lo mismo en el mismo archivo; con uno
+// solo, si algun dia esta mal, esta mal en un lugar y no en dos.
+void SasEgm::responderContadorBCD(uint8_t comando, uint64_t valor) {
+	uint8_t payload[8];
+	payload[0] = DIRECCION_SAS;
+	payload[1] = comando;
+	bcdEncodeSas(&payload[2], valor, 4);
+
+	uint16_t crc = calcularCrc16Kermit(payload, 6);
+	payload[6] = (uint8_t)(crc & 0xFF);
+	payload[7] = (uint8_t)((crc >> 8) & 0xFF);
+	enviarTramaSas(payload, 8);
+}
+
+// ---------------------------------------------------------------------------
+//  RESPUESTA DE VARIOS MEDIDORES EN UNA SOLA TRAMA
+//
+//  direccion + comando + N medidores de 4 BCD + CRC.  No lleva byte de
+//  largo: el host ya sabe cuantos medidores trae cada comando, y por eso el
+//  orden y la cantidad NO se pueden cambiar.
+//
+//    0x0F -> 6 medidores (24 bytes de datos), trama de 28
+//    0x19 -> 5 medidores (20 bytes de datos), trama de 24
+//
+//  Si algun dia se manda un medidor de mas o de menos, el host lee todo
+//  corrido y le asigna el valor equivocado a cada campo.  Eso no se ve como
+//  un error en el sniffer: se ve como una maquina con numeros raros.
+// ---------------------------------------------------------------------------
+void SasEgm::responderBloqueMedidores(uint8_t comando,
+                                            const uint64_t* valores,
+                                            uint8_t nValores) {
+	if (valores == nullptr) return;
+
+	uint8_t  r[40];
+	uint16_t n = 0;
+
+	// 2 de cabecera + N x 4 + 2 de CRC tiene que caber.
+	if ((uint16_t)(2 + nValores * 4 + 2) > sizeof(r)) return;
+
+	r[n++] = DIRECCION_SAS;
+	r[n++] = comando;
+
+	for (uint8_t i = 0; i < nValores; i++) {
+		bcdEncodeSas(&r[n], valores[i], 4);
+		n = (uint16_t)(n + 4);
+	}
+
+	const uint16_t crc = calcularCrc16Kermit(r, n);
+	r[n++] = (uint8_t)(crc & 0xFF);
+	r[n++] = (uint8_t)((crc >> 8) & 0xFF);
+	enviarTramaSas(r, n);
+}
+
+// ---------------------------------------------------------------------------
+//  ACK DE UN BYTE
+//
+//  Los long polls que no devuelven datos se contestan con la propia
+//  direccion.  El NACK seria esa misma direccion con el bit 7 puesto, pero
+//  no lo uso: si la trama no me cuadra prefiero no contestar nada, que en
+//  SAS es valido y no le promete nada al host.
+// ---------------------------------------------------------------------------
+void SasEgm::responderAckSimple() {
+	const uint8_t ack = DIRECCION_SAS;
+	enviarTramaSas(&ack, 1);
+}
+
+// ---------------------------------------------------------------------------
+//  BCD: cada nibble es un digito decimal.  1234 se guarda 0x12 0x34.
+//  Se recorta al maximo que cabe para que un desbordamiento no escriba
+//  nibbles con valores A-F, que el host leeria como basura.
+// ---------------------------------------------------------------------------
+void SasEgm::bcdEncodeSas(uint8_t* destino, uint64_t valor, uint8_t nBytes) {
+    // -----------------------------------------------------------------
+    //  SE SATURA, NO SE DA LA VUELTA.  Esto era un bug de verdad.
+    //
+    //  Antes decia "valor %= 100000000ULL" con la idea de recortar lo que
+    //  no cupiera.  Lo que hace un modulo es dar la vuelta, y eso en un
+    //  medidor de contabilidad es lo peor que puede pasar:
+    //
+    //      99,999,999 creditos  ->  99 99 99 99   bien
+    //     100,000,000 creditos  ->  00 00 00 00   <-- el medidor en CERO
+    //     123,456,789 creditos  ->  23 45 67 89   <-- cien millones menos
+    //
+    //  O sea que despues de cuidar tanto que ningun medidor fuera para
+    //  atras, el propio codificador lo tiraba a cero solito al desbordarse.
+    //  Un host que ve eso da por perdida la contabilidad de la maquina.
+    //
+    //  Saturando, el medidor se queda clavado en todo nueves, que es lo que
+    //  hace un contador mecanico y lo que un auditor espera ver.  Ademas
+    //  quita las dos unicas divisiones de 64 bits que quedaban aqui -en un
+    //  Cortex-M3 no hay division de 64 bits por hardware y cada una se iba
+    //  a __aeabi_uldivmod- y el codigo sale 12 bytes mas chico.
+    // -----------------------------------------------------------------
+    if      (nBytes == 4) { if (valor > 99999999ULL)   valor = 99999999ULL; }
+    else if (nBytes == 5) { if (valor > 9999999999ULL) valor = 9999999999ULL; }
+
+    for (int i = nBytes - 1; i >= 0; --i) {
+        uint8_t bajo = valor % 10; valor /= 10;
+        uint8_t alto = valor % 10; valor /= 10;
+        destino[i] = (uint8_t)((alto << 4) | bajo);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  CONFIGURACION QUE SE DEFINE AQUI  (ver la explicacion en SasEgm.h)
+// ---------------------------------------------------------------------------
+
+// true  = los pulsos del hopper NO regresan a la placa: se apunta aqui.
+// false = SI regresan: el medidor ya sube solo, apuntarlo lo contaria doble.
+const bool SasEgm::CASHOUT_REFLEJA_EN_SAS = true;
+
+// Identidad que contesto en el 0x54.  Van en ASCII.
+const char* const SasEgm::SAS_VERSION_ASCII = "602";
+const char* const SasEgm::SERIE_MAQUINA     = "PULSOS001";
+
+// ---------------------------------------------------------------------------
+//  Identidad que contesto en el 0x1F.  Tambien en ASCII, y con el LARGO
+//  EXACTO que pide la tabla 7.10 del SAS 6.02: 2, 3, 6 y 4 caracteres.
+//
+//  El armador recorta o rellena con '0' para que siempre salgan del tamano
+//  correcto, pero dejarlos ya del largo bueno hace obvio que se leyo la
+//  tabla y no se puso lo primero que cupo.
+//
+//  El porcentaje va SIN punto: el "88.50" se transmite "8850", y el host le
+//  pone el punto donde va.
+// ---------------------------------------------------------------------------
+const char* const SasEgm::ID_JUEGO_ASCII        = "PL";     // PuLsos
+const char* const SasEgm::ID_JUEGO_EXTRA_ASCII  = "000";    // no hay ID extra
+const char* const SasEgm::ID_PAYTABLE_ASCII     = "000000"; // POR CONFIRMAR
+const char* const SasEgm::PORCENTAJE_PAGO_ASCII = "0000";   // POR CONFIRMAR
+
+
+// ---------------------------------------------------------------------------
+//  ESTADO DE LOS MEDIDORES QUE LLEVO YO
+//
+//  Estas variables son lo que mueven los set_*.  Lo demas sale de los
+//  contadores de pulsos que se hayan vinculado con vincularContadores().
+//
+//  OJO: viven en RAM.  Si la placa no vincula contadores persistentes, los
+//  medidores vuelven a cero al reiniciar.
+//
+//  LOS AJUSTES SON PROGRESIVOS: se SUMAN a lo que ya traia el contador de
+//  pulsos y nunca se restan.  Un medidor SAS es un acumulado de por vida y
+//  no puede ir para atras; un host que ve un medidor bajar da por perdida
+//  toda la contabilidad de esa maquina.
+// ---------------------------------------------------------------------------
+
+// Lo que reporto en el 0x1A.  Este SI sube y baja: no es un acumulado, es el
+// saldo que el jugador tiene en pantalla ahora mismo.
+static uint32_t g_creditoActual = 0;
+
+// Ajustes que sumo encima de los contadores de pulsos.  Los mueven los
+// setters de abajo.
+static uint32_t g_ajusteBillIn  = 0;   // se suma al 0x0B  (BI)
+static uint32_t g_ajusteHandpay = 0;   // se suma al 0x23 y al 0x04 (HP y CC)
+static uint32_t g_ajusteBet     = 0;   // se suma al 0x02  (BET)
+static uint32_t g_ajusteAftOut  = 0;   // se suma al 0x18  (retiros por AFT)
+
+// Con estos dos sigo los contadores de pulsos entre una vuelta y otra, para
+// saber cuanto se movieron y aplicar esa diferencia al saldo.
+static int32_t g_ultBillInPulsos = 0;
+static int32_t g_ultCashOutPulsos = 0;
+static bool    g_primeraLectura   = true;
+
+// ---------------------------------------------------------------------------
+//  HAND PAY PENDIENTE  (lo que contesto en el 0x1B)
+//
+//  El 0x1B no es un medidor: es la ficha del hand pay que esta trabado AHORA.
+//  Mientras no haya ninguno la trama sale toda en ceros, que es justo lo que
+//  manda la seccion 7.8.2 del SAS 6.02.
+// ---------------------------------------------------------------------------
+static bool     g_handpayPendiente = false;
+static uint32_t g_handpayMonto     = 0;
+
+// ---------------------------------------------------------------------------
+//  COLA DE EXCEPCIONES  (solo se usa si EXCEPCIONES_SAS_ACTIVO esta en true)
+//
+//  "En vuelo" quiere decir: ya la transmiti pero el host todavia no me la ha
+//  acusado.  Hasta que la acuse NO la puedo borrar, porque si el host repite
+//  el mismo poleo general es que no la recibio y tengo que mandar la misma.
+// ---------------------------------------------------------------------------
+static uint8_t  g_excPendiente      = 0x00;   // la que toca mandar
+static bool     g_excEnVuelo        = false;
+static uint8_t  g_excEnVueloCodigo  = 0x00;
+
+// Cuando se encolo la ultima excepcion.  De aqui cuenta la reemision del
+// 0x51 que pide la seccion 7.8.1.
+static uint32_t g_msUltimaExc51     = 0;
+
+// Cuantos avisos se perdieron porque llego otro encima.  Si esto sube y
+// sube, hay mas eventos que poleos y habria que pasar a una cola de verdad.
+// Se mira en el debugger.
+static uint32_t g_excPisadas_       = 0;
+
+// ---------------------------------------------------------------------------
+//  ESTADO DEL ENLACE CON EL HOST
+//
+//  Arranca CAIDO: mientras no llegue el primer poleo no hay enlace, y eso es
+//  la verdad.
+// ---------------------------------------------------------------------------
+static bool     g_enlaceArriba   = false;
+static uint32_t g_msUltimaTrama  = 0;
+static uint32_t g_caidasEnlace   = 0;   // diagnostico, se mira en el debugger
+
+// Lee un contador vinculado.  El que no se vinculo cuenta como cero, y un
+// valor negativo -contador corrupto- tambien.
+static inline uint64_t leerContador(const int* p) {
+    if (p == nullptr || *p < 0) return 0;
+    return (uint64_t)(*p);
+}
+
+// Modo mantenimiento: lo prende el long poll 0x0A y lo apaga el 0x0B.  Aqui
+// no hace nada mas que quedar registrado; lo dejo para poder verlo en el
+// debugger y saber si el host lo esta usando.
+static bool     g_modoMantenimiento = false;
+
+
+// ===========================================================================
+//  ACCESORES  -  la unica puerta para tocar la contabilidad
+//
+//  Todo junto a proposito: aqui esta TODO lo que mueve un medidor.  Si un
+//  numero cambio y no se sabe por que, esta en este bloque.
+//
+//  Los ajustes g_* son PROGRESIVOS: se suman al contador de pulsos y nunca se
+//  restan.  Un medidor SAS es un acumulado de por vida, y un host que lo ve
+//  bajar da por perdida la contabilidad de la maquina.
+// ===========================================================================
+
+// --- lectura ---------------------------------------------------------------
+
+uint32_t SasEgm::creditoActual() const { return g_creditoActual; }
+
+// El manual prohibe bloquear para AFT si hay un hand pay esperando: seria
+// pagar dos veces.  Lo consulta SasEgm_aft.cpp.
+bool SasEgm::hayHandpayPendiente() const { return g_handpayPendiente; }
+
+// --- escritura -------------------------------------------------------------
+
+// Fija el saldo (0x1A) y registra la subida como entrada de billetero.
+// Sube el 0x0B porque el credito tiene que venir de algun lado: si el 0x1A
+// dice 10 y el 0x0B no se movio, el host lo ve aparecido de la nada.
+void SasEgm::set_CurrentCredit(uint32_t creditos) {
+    if (creditos > g_creditoActual) g_ajusteBillIn += (creditos - g_creditoActual);
+    g_creditoActual = creditos;
+}
+
+// Pago a mano: sube el 0x23 y el 0x04, baja el saldo con piso en cero.
+void SasEgm::set_Handpay(uint32_t creditos) {
+    g_ajusteHandpay += creditos;
+
+    if (creditos >= g_creditoActual) g_creditoActual = 0;
+    else                             g_creditoActual -= creditos;
+
+    // Cada hand pay se reporta UNA vez (7.8.1).  Si el anterior ya se leyo
+    // este empieza limpio; si no, se suma.
+    //
+    // Lo tenia sumando SIEMPRE y sin limpiar nunca: cuatro cash outs de diez
+    // reportaron 10, 20, 30 y 40 en el 0x1B y el sistema genero cuatro
+    // tickets crecientes.  Salio en la prueba de estres.
+    if (g_handpayPendiente) g_handpayMonto += creditos;
+    else                    g_handpayMonto  = creditos;
+
+    g_handpayPendiente = true;
+
+    encolarExcepcionSas(SAS_EXC_HANDPAY_PENDIENTE);
+}
+
+// Apuesta -> medidor 0x00.  Progresivo, solo sube.
+void SasEgm::set_Bet(uint32_t creditos) {
+    g_ajusteBet += creditos;
+}
+
+// Retiro por AFT: sube el 0x18 y baja el saldo.  PRIVADO: solo lo llama el AFT.
+//
+// Deliberadamente NO toca el 0x04 ni el 0x23 y NO levanta hand pay pendiente.
+// Un retiro electronico y un pago a mano son eventos distintos y el casino los
+// tiene que poder separar.  Y si levantara hand pay, el manual prohibiria
+// bloquear para el SIGUIENTE AFT: dos retiros seguidos no funcionaban.
+void SasEgm::set_AftOut(uint32_t creditos) {
+    g_ajusteAftOut += creditos;
+
+    if (creditos >= g_creditoActual) g_creditoActual = 0;
+    else                             g_creditoActual -= creditos;
+}
+
+// Cash out propio de la placa, ya pagado.  La bandera se mira AQUI ADENTRO:
+// si los pulsos del hopper regresan por su entrada ya suben el medidor solos,
+// y eso es una propiedad del cableado, no de quien llama.
+void SasEgm::registrarCashOutLocal(uint32_t creditos) {
+    if (!CASHOUT_REFLEJA_EN_SAS) return;
+    set_Handpay(creditos);
+}
+
+// Todo a cero.
+void SasEgm::reiniciarContabilidad() {
+    g_ajusteBillIn  = 0;
+    g_ajusteHandpay = 0;
+    g_ajusteBet     = 0;
+    g_ajusteAftOut  = 0;
+    g_creditoActual = 0;
+
+    // Hay que volver a tomar la referencia de los deltas, o
+    // actualizarCreditoPorPulsos() intenta interpretar el salto a cero.
+    g_primeraLectura = true;
+}
+
+
+// ===========================================================================
+//  COLA DE EXCEPCIONES
+// ===========================================================================
+
+// El 0x51, 0x52, 0x6F y 0x69 estan marcadas con P -prioritaria- en el manual,
+// y por la misma razon: las cuatro llevan dinero detras.
+static bool excEsPrioritaria(uint8_t codigo) {
+    return codigo == 0x51 || codigo == 0x52 ||
+           codigo == 0x6F || codigo == 0x69;
+}
+
+void SasEgm::encolarExcepcionSas(uint8_t codigo) {
+    if (!EXCEPCIONES_SAS_ACTIVO) return;
+
+    const bool nuevaEsPrio = excEsPrioritaria(codigo);
+
+    // Prioridad, encontrada en el banco y no supuesta: la placa quedaba
+    // reenviando un aviso normal -que es lo correcto ante un NACK- y el 0x51
+    // del hand pay NUNCA salia.  El aviso menos importante tapaba al unico
+    // que de verdad importa.
+    //
+    //   - una prioritaria pisa lo que sea, pendiente o en vuelo.
+    //   - una normal NO pisa a una prioritaria.
+    //
+    // Perder un 0x4F no cuesta: el 0x0B ya lleva el dinero y el host lo ve en
+    // el siguiente 0x2F.  Perder un 0x51 si cuesta.
+    if (!nuevaEsPrio) {
+        if (excEsPrioritaria(g_excPendiente)) { g_excPisadas_++; return; }
+        if (g_excEnVuelo && excEsPrioritaria(g_excEnVueloCodigo)) { g_excPisadas_++; return; }
+    }
+    else if (g_excEnVuelo && !excEsPrioritaria(g_excEnVueloCodigo)) {
+        // Se abandona el reenvio de la normal: sin esto el bucle de NACK no
+        // suelta nunca a la prioritaria.
+        g_excEnVuelo = false;
+        g_excPisadas_++;
+    }
+
+    if (g_excPendiente != 0x00 && g_excPendiente != codigo) g_excPisadas_++;
+
+    g_excPendiente = codigo;
+
+    // El reloj de la reemision arranca aqui, no en el arranque de la placa.
+    if (codigo == SAS_EXC_HANDPAY_PENDIENTE) g_msUltimaExc51 = HAL_GetTick();
+}
+
+
+// ---------------------------------------------------------------------------
+//  EL SALDO SIGUE A LOS PULSOS REALES
+//
+//  Esto corre en cada vuelta del lazo.  Mira cuanto se movieron los
+//  contadores de pulsos desde la vuelta anterior y aplica esa diferencia al
+//  saldo: lo que entra por billetero sube, lo que sale por cash out baja.
+//
+//  Trabajo por DIFERENCIAS y no restando los dos acumulados, porque esos dos
+//  numeros se empezaron a contar en momentos distintos y se han borrado en
+//  momentos distintos: su resta no es un saldo, no significa nada.
+//
+//  Un delta negativo significa que alguien borro los contadores (RAM clear).
+//  En ese caso no resto nada, solo vuelvo a tomar la referencia: restarlo le
+//  quitaria al jugador credito que si tenia.
+// ---------------------------------------------------------------------------
+void SasEgm::actualizarCreditoPorPulsos() {
+    // Sin contadores vinculados el saldo lo llevan solo los set_*.
+    if (pBillIn_ == nullptr && pCashOut_ == nullptr) return;
+
+    const int32_t billIn  = (pBillIn_  != nullptr) ? (int32_t)*pBillIn_  : 0;
+    const int32_t cashOut = (pCashOut_ != nullptr) ? (int32_t)*pCashOut_ : 0;
+
+    if (g_primeraLectura) {
+        g_ultBillInPulsos  = billIn;
+        g_ultCashOutPulsos = cashOut;
+        g_primeraLectura   = false;
+        return;
+    }
+
+    const int32_t dIn  = billIn  - g_ultBillInPulsos;
+    const int32_t dOut = cashOut - g_ultCashOutPulsos;
+    g_ultBillInPulsos  = billIn;
+    g_ultCashOutPulsos = cashOut;
+
+    if (dIn < 0 || dOut < 0) return;      // hubo RAM clear, solo re-referencio
+
+    const int32_t saldo = (int32_t)g_creditoActual + dIn - dOut;
+    g_creditoActual = (saldo > 0) ? (uint32_t)saldo : 0;
+}
+
+
+// ---------------------------------------------------------------------------
+//  DE CODIGO DE MEDIDOR SAS A VARIABLE DE LA PLACA
+//
+//  Esta funcion es la tabla de medidores: aqui se decide que numero contesta
+//  la placa para cada codigo que pida el host.
+//
+//  Cada medidor sale del contador vinculado en vincularContadores() -si hay
+//  uno- mas el ajuste que hayan metido los setters.  Los contadores que se
+//  vinculen tienen que ser PROGRESIVOS (nunca se reinician), porque un
+//  medidor SAS no puede ir para atras.
+//
+//  MAPEO ACORDADO EN LA REUNION TECNICA:
+//
+//     0x02  BET  - apostado          <- pulso BET      + ajuste
+//     0x04  CC   - creditos cancel.  <- pulso CASH OUT + ajuste hand pay
+//     0x0B  BI   - billetero         <- pulso CASH IN  + ajuste
+//     0x23  HP   - hand paid         <- va a la par del 0x04
+//
+//  El 0x23 sale del mismo numero que el 0x04 a proposito: en una maquina de
+//  ruta el cash out no lo paga una tolva, lo paga una persona, asi que ese
+//  mismo evento es a la vez un credito cancelado y un credito pagado a mano.
+//  Como salen de la misma fuente, no se pueden desfasar.
+//
+//  Los medidores que esta placa no tiene de donde sacar se contestan en CERO
+//  y no se omiten: una maquina de ruta sin contador de jackpots tiene, de
+//  verdad, cero jackpots, y asi el host la ve completa.
+//
+//  Devuelve true si el medidor tiene una fuente real detras.  El que
+//  devuelve false igual se contesta, pero en cero.
+// ---------------------------------------------------------------------------
+bool SasEgm::obtenerValorMedidorRuta(uint8_t codigo, uint64_t* salida) {
+    if (salida == nullptr) return false;
+    *salida = 0;
+
+    const uint64_t k = (uint64_t)SAS_CREDITOS_POR_PULSO;
+
+    switch (codigo) {
+        // ------------------------------------------------------------------
+        // 0x00 Total coin in credits.  ESTE ES EL BET.
+        //
+        // En SAS no existe un medidor que se llame "bet": lo apostado se
+        // reporta como "coin in", que es el nombre que quedo de cuando las
+        // maquinas tragaban monedas.  Tabla C-7 del manual 6.02.
+        //
+        // OJO: antes aqui tambien caia el 0x02, porque asi venia en el
+        // pizarron.  Estaba mal.  Segun la tabla C-7 el 0x02 es "Total
+        // jackpot credits" y no tiene nada que ver con la apuesta.  Mandar
+        // el BET ahi le inventaba premios a la maquina, y como el 0x22
+        // -total ganado- y el 0x23 -total pagado a mano- se definen SUMANDO
+        // el jackpot, el error se propagaba a esos dos tambien.
+        // ------------------------------------------------------------------
+        case 0x00:
+            *salida = (leerContador(pApostado_) + g_ajusteBet) * k;
+            return true;
+
+        // 0x0C Current credits.  Es el mismo saldo que contesto en el long
+        // poll 0x1A.  Lo pongo aqui para que un host que lo pida por 0x2F -en
+        // vez de por 0x1A- reciba el numero de verdad y no un cero.
+        case 0x0C:
+            *salida = (uint64_t)g_creditoActual * k;
+            return true;
+
+        // 0x0B credits from bill accepted.  El cash in de esta placa entra
+        // por billetero.
+        case 0x0B:
+            *salida = (leerContador(pBillIn_) + g_ajusteBillIn) * k;
+            return true;
+
+        // 0x04 Total cancelled credits y 0x23 Total hand paid credits.
+        //
+        // Los dos contestan el mismo numero porque asi lo pedi: lo que sale
+        // por el CC-04 se tiene que ver a la par en el 23.
+        //
+        // PENDIENTE DE REVISAR CON EL MANUAL.  La tabla C-7 define el 0x23
+        // como "hand paid cancelled credits + jackpot", o sea 0x03 + 0x02, y
+        // no como una copia del 0x04.  Con el jackpot en cero, el 0x23
+        // deberia seguir al 0x03 -el pulso de HAND PAY- y no al hopper.
+        // Lo dejo como esta porque asi lo acordamos y asi lo estamos
+        // probando, pero antes de campo hay que decidirlo.
+        case 0x04:
+        case 0x23:
+            *salida = (leerContador(pCashOut_) + g_ajusteHandpay) * k;
+            return true;
+
+        // 0x18 Total electronic transfers to host: los retiros por AFT.  Es
+        // la casilla que el host pinta como AFT_OUT.
+        case 0x18:
+            *salida = (uint64_t)g_ajusteAftOut * k;
+            return true;
+
+        // 0x03 hand paid cancelled credits.  Sale del pulso de HAND PAY
+        // propio de la placa, que es otra entrada distinta al cash out.
+        case 0x03:
+            *salida = leerContador(pHandpay_) * k;
+            return true;
+
+        // Sin fuente en esta placa: se contesta cero.  Aqui caen, entre
+        // otros, el 0x02 -jackpot: esta maquina no paga premios-, el 0x01
+        // -coin out-, el 0x17 y el 0x18 -transferencias AFT-, el 0x24
+        // -drop- y el 0x25/0x26 -partidas-.  Todos son cero de verdad o
+        // sencillamente no los podemos medir.
+        //
+        // El pulso de REFILL todavia no tiene medidor asignado.
+        default:
+            return false;
+    }
+}
+
+// Atajo del de arriba.  Devuelve el valor y ya; el medidor sin fuente sale
+// en cero.  Esta para que los long polls de medidor suelto -0x10, 0x11,
+// 0x46- saquen el dato del MISMO lugar que el 0x2F y no puedan contradecirlo.
+uint64_t SasEgm::medidorSas(uint8_t codigo) {
+    uint64_t v = 0;
+    obtenerValorMedidorRuta(codigo, &v);
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+//  CUANTOS BYTES BCD OCUPA CADA MEDIDOR EN EL 0x2F
+//
+//  Antes daba por hecho que todos eran de 4 bytes.  No es cierto.  La nota
+//  arriba de la tabla C-7 dice que el 0x2F reporta cada medidor con el "Min
+//  Size" de la tabla, y ahi hay medidores de 5:
+//
+//     0x0D..0x10   tickets SAS en centavos
+//     0x80..0xBE   tickets y transferencias AFT en centavos
+//
+//  Todo lo demas es de 4.
+//
+//  POR QUE IMPORTA AUNQUE ESTA PLACA NO TENGA TICKETS NI AFT:
+//  el 0x2F no lleva separadores.  Si el host pide un medidor de 5 y le
+//  contesto 4, TODO lo que viene detras se le recorre un byte y lee basura,
+//  aunque el valor que mandamos sea cero.  Una placa que tiene que servirle a
+//  cualquier host no puede suponer el tamano: lo tiene que saber.
+// ---------------------------------------------------------------------------
+static uint8_t tamanoMedidorSas(uint8_t codigo) {
+    if (codigo >= 0x0D && codigo <= 0x10) return 5;
+    if (codigo >= 0x80 && codigo <= 0xBE) return 5;
+    return 4;
+}
+
+// ---------------------------------------------------------------------------
+//  LONG POLL 0x2F  -  medidores selectos del juego N
+//
+//  Peticion:  01 2F <len> <juegoH> <juegoL> <cod>...<cod> <CRClo> <CRChi>
+//  Respuesta: 01 2F <len> <juegoH> <juegoL> <cod><4 BCD>... <CRClo> <CRChi>
+//
+//  <len> cuenta lo que va DESPUES del propio byte de largo y ANTES del CRC.
+// ---------------------------------------------------------------------------
+bool SasEgm::procesarComandoContadoresDetallados(const uint8_t* trama,
+                                                       uint16_t largoTrama) {
+    if (trama == nullptr || largoTrama < 7) return false;
+
+    const uint8_t lenPeticion = trama[2];
+
+    // Minimo 2 (solo el numero de juego).  El tope lo pone nuestro buffer de
+    // salida, no un numero magico.
+    if (lenPeticion < 3) return false;
+    const uint8_t nMedidores = (uint8_t)(lenPeticion - 2);
+    if (nMedidores > SAS_MAX_MEDIDORES) return false;
+
+    const uint16_t largoTotal = (uint16_t)(3 + lenPeticion + 2);
+    if (largoTrama < largoTotal) return false;
+
+    // CRC sobre todo menos los dos bytes del propio CRC.  Byte bajo primero.
+    const uint16_t crcCalculado = calcularCrc16Kermit(trama, (uint16_t)(largoTotal - 2));
+    const uint16_t crcTrama     = (uint16_t)(trama[largoTotal - 2] |
+                                            (trama[largoTotal - 1] << 8));
+    if (crcCalculado != crcTrama) { sasCrcMalos_++; return false; }
+
+    temporizadorUltimoSas_ = HAL_GetTick();
+
+    const uint8_t  gameNumH = trama[3];
+    const uint8_t  gameNumL = trama[4];
+    const uint8_t* codigos  = &trama[5];
+
+    // Lo mas grande que puede salir de aqui: 3 de cabecera + 0x3E de datos
+    // + 2 de CRC = 69 bytes.  Con 128 sobra.
+    uint8_t  respuesta[128];
+    uint16_t n = 0;
+
+    respuesta[n++] = DIRECCION_SAS;
+    respuesta[n++] = 0x2F;
+    const uint16_t posLen = n;
+    respuesta[n++] = 0x00;            // se rellena al final
+    respuesta[n++] = gameNumH;
+    respuesta[n++] = gameNumL;
+
+    // SE CONTESTAN TODOS LOS QUE PIDAN, sin excepcion.
+    //
+    // Antes se omitian los que la placa no tiene y el host recibia una trama
+    // mas corta que su peticion.  Eso deja a la maquina incompleta en la
+    // pantalla del casino, y un host que indexe por posicion en vez de por
+    // codigo se desincroniza entero.  Ahora la respuesta SIEMPRE espeja la
+    // peticion: mismo numero de medidores, en el mismo orden.
+    //
+    // El que no tenemos va en cero fijo, y cero es el dato correcto: una
+    // maquina de ruta sin contador de jackpots tiene, de verdad, cero
+    // jackpots.
+    for (uint8_t i = 0; i < nMedidores; i++) {
+        const uint8_t codigo = codigos[i];
+
+        uint64_t valor = 0;
+        obtenerValorMedidorRuta(codigo, &valor);   // sin fuente -> queda en 0
+
+        // Cada medidor con SU tamano, el que dice la tabla C-7.
+        const uint8_t tamanoBcd = tamanoMedidorSas(codigo);
+
+        // Dos topes, y los dos tienen que cumplirse:
+        //
+        //   1. el byte de largo del 0x2F no puede pasar de 0x3E (tabla 7.3b).
+        //      Ese byte cuenta el numero de juego mas todos los pares, sin
+        //      el CRC.  Si me paso, el byte se desborda y el host lee una
+        //      trama de otro tamano del que de verdad mande.
+        //   2. el buffer de salida.
+        //
+        // Si un host pide mas de lo que cabe, contesto lo que alcance en vez
+        // de no contestar nada.  El manual lo permite y una respuesta corta
+        // le sirve mas al host que el silencio.
+        const uint16_t largoSiLoAgrego = (uint16_t)((n - 3) + 1 + tamanoBcd);
+        if (largoSiLoAgrego > SAS_2F_LARGO_MAX) break;
+        if ((uint16_t)(n + 1 + tamanoBcd + 2) > sizeof(respuesta)) break;
+
+        respuesta[n++] = codigo;
+        bcdEncodeSas(&respuesta[n], valor, tamanoBcd);
+        n = (uint16_t)(n + tamanoBcd);
+    }
+
+    respuesta[posLen] = (uint8_t)(n - 3);
+
+    const uint16_t crcRespuesta = calcularCrc16Kermit(respuesta, n);
+    respuesta[n++] = (uint8_t)(crcRespuesta & 0xFF);
+    respuesta[n++] = (uint8_t)((crcRespuesta >> 8) & 0xFF);
+
+    enviarTramaSas(respuesta, n);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+//  Copia una cadena ASCII con LARGO FIJO.
+//
+//  Si es mas corta rellena con '0', si es mas larga la recorta.  Los campos
+//  del 0x1F son de largo fijo y la trama no lleva byte de longitud: un
+//  caracter de mas o de menos le corre TODO al host y le cambia el paytable
+//  y el porcentaje de pago por basura.
+//
+//  Se rellena con '0' y no con espacio porque asi lo pide la tabla 7.10 para
+//  el ID adicional, y prefiero un solo criterio para los cuatro campos.
+// ---------------------------------------------------------------------------
+static void copiarAsciiFijo(uint8_t* destino, const char* texto, uint8_t largo) {
+    uint8_t i = 0;
+    if (texto != nullptr) {
+        for (; i < largo && texto[i] != '\0'; i++) destino[i] = (uint8_t)texto[i];
+    }
+    for (; i < largo; i++) destino[i] = (uint8_t)'0';
+}
+
+// ---------------------------------------------------------------------------
+//  LONG POLL 0x1F  -  identidad de la maquina
+//
+//  Respuesta de 24 bytes, tabla 7.10 del SAS 6.02:
+//
+//    01 1F <ID 2 ASCII> <ID extra 3 ASCII> <denom 1> <apuesta max 1>
+//          <grupo progresivo 1> <opciones 2> <paytable 6 ASCII>
+//          <porcentaje 4 ASCII> <CRC 2>
+//
+//  NO lleva byte de longitud: es de largo fijo y el host cuenta posiciones.
+//
+//  Tres de estos campos -denominacion, apuesta maxima y porcentaje- los
+//  define el casino o la jurisdiccion, no yo.  Van en cero hasta que me
+//  pasen los buenos: prefiero que se note que faltan a inventar un numero
+//  que el host se crea y que despues no cuadre con el alta de la maquina.
+// ---------------------------------------------------------------------------
+void SasEgm::responderIdentidadMaquina() {
+    uint8_t  r[24];
+    uint16_t n = 0;
+
+    r[n++] = DIRECCION_SAS;
+    r[n++] = 0x1F;
+
+    copiarAsciiFijo(&r[n], ID_JUEGO_ASCII,       2);  n += 2;
+    copiarAsciiFijo(&r[n], ID_JUEGO_EXTRA_ASCII, 3);  n += 3;
+
+    r[n++] = CODIGO_DENOMINACION;
+    r[n++] = APUESTA_MAXIMA;
+    r[n++] = GRUPO_PROGRESIVO;
+    r[n++] = OPCIONES_JUEGO_HI;
+    r[n++] = OPCIONES_JUEGO_LO;
+
+    copiarAsciiFijo(&r[n], ID_PAYTABLE_ASCII,     6);  n += 6;
+    copiarAsciiFijo(&r[n], PORCENTAJE_PAGO_ASCII, 4);  n += 4;
+
+    const uint16_t crc = calcularCrc16Kermit(r, n);
+    r[n++] = (uint8_t)(crc & 0xFF);
+    r[n++] = (uint8_t)((crc >> 8) & 0xFF);
+    enviarTramaSas(r, n);
+}
+
+// ---------------------------------------------------------------------------
+//  LONG POLL 0x1B  -  informacion del hand pay
+//
+//  Respuesta de 24 bytes, tabla 7.8 del SAS 6.02:
+//
+//    01 1B <grupo 1> <nivel 1> <monto 5 BCD> <pago parcial 2 BCD>
+//          <reset ID 1> <10 bytes sin usar> <CRC 2>
+//
+//  Nivel = 0x80, que en la tabla es "cancelled credits amount".  Es lo
+//  correcto para esta placa: aqui no hay premios ni progresivos, el unico
+//  hand pay que existe es el cash out del saldo, o sea creditos cancelados.
+//  -Mi otro proyecto manda 0x00 en este campo, que significa "premio no
+//  progresivo".  Ahi quedo pendiente cambiarlo.-
+//
+//  El monto va en unidades de la denominacion SAS -creditos-, NO en centavos.
+//  Eso lo dice la tabla: solo cuando el hand pay trae parte de un progresivo
+//  el monto se manda en centavos, y aqui nunca es el caso.
+//
+//  Si no hay hand pay trabado sale todo en ceros.  Asi lo pide la seccion
+//  7.8.2: "long poll 1B returns all zeros whenever the gaming machine is not
+//  currently in a handpay lockup".
+// ---------------------------------------------------------------------------
+void SasEgm::responderHandpayInfo() {
+    uint8_t  r[24];
+    for (uint8_t i = 0; i < sizeof(r); i++) r[i] = 0x00;
+
+    r[0] = DIRECCION_SAS;
+    r[1] = 0x1B;
+
+    if (g_handpayPendiente) {
+        r[2] = 0x00;   // grupo progresivo: ninguno
+        r[3] = 0x80;   // nivel: creditos cancelados
+
+        // Monto en 5 BCD.  r[9] y r[10] -pago parcial- quedan en cero: aqui
+        // no se paga nada por adelantado, el cash out sale completo.
+        // r[11] -reset ID- en cero: solo hay reset estandar, esta placa no
+        // sabe devolver el hand pay al medidor de creditos.
+        //
+        // La unidad la decide HANDPAY_1B_EN_CENTAVOS.  Ver la nota larga en
+        // el .h: el manual pide creditos, pero mi host divide este campo
+        // entre 100 y por eso diez dolares salian como $0,10.
+        uint64_t monto = (uint64_t)g_handpayMonto * (uint64_t)SAS_CREDITOS_POR_PULSO;
+        if (HANDPAY_1B_EN_CENTAVOS) monto *= (uint64_t)CENTAVOS_POR_CREDITO;
+
+        bcdEncodeSas(&r[4], monto, 5);
+    }
+
+    const uint16_t crc = calcularCrc16Kermit(r, 22);
+    r[22] = (uint8_t)(crc & 0xFF);
+    r[23] = (uint8_t)((crc >> 8) & 0xFF);
+    enviarTramaSas(r, 24);
+
+    // -------------------------------------------------------------------
+    //  REPORTADO = FUERA DE LA COLA
+    //
+    //  Esta placa NO se traba esperando al tecnico: pulsa el hopper, paga y
+    //  sigue.  Asi que en cuanto el host pregunta por el pago, el pago ya
+    //  esta hecho y la ficha se cierra aqui mismo.
+    //
+    //  Sin esto el monto se quedaba pendiente para siempre, el siguiente
+    //  cash out le sumaba encima, y el 0x1B iba reportando 10, 20, 30, 40.
+    //
+    //  Y se avisa con la excepcion 0x52 -hand pay reseteado-, que es lo que
+    //  pide la 7.8.1 una vez que el 0x1B se contesto y el pago se resolvio.
+    //  Asi el host cierra su lado en vez de quedarse esperando un 0x94 que
+    //  en esta placa nunca va a hacer falta.
+    //
+    //  Riesgo asumido: si la respuesta se pierde en el aire, el host vuelve
+    //  a pedir el 0x1B y recibe ceros.  Prefiero eso a un monto que crece
+    //  solo, que es dinero mal reportado.
+    // -------------------------------------------------------------------
+    if (g_handpayPendiente) {
+        g_handpayPendiente = false;
+        g_handpayMonto     = 0;
+        encolarExcepcionSas(SAS_EXC_HANDPAY_RESETEADO);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  DESPACHADOR DE LONG POLLS
+// ---------------------------------------------------------------------------
+void SasEgm::ProcesarComandoSAS(const uint8_t* trama, uint16_t largoTrama) {
+    if (largoTrama < 2)              return;
+    if (trama[0] != DIRECCION_SAS)   return;   // es para otra maquina del bus
+
+    sasTramasAtendidas_++;
+
+    const uint8_t comando = trama[1];
+    const uint64_t k = (uint64_t)SAS_CREDITOS_POR_PULSO;
+
+    switch (comando) {
+        case 0x2F:
+            procesarComandoContadoresDetallados(trama, largoTrama);
+            break;
+
+        // 0x1A = creditos actuales.  Lo que el jugador tiene en pantalla
+        // ahora mismo, no un acumulado.  Lo lleva actualizarCreditoPorPulsos()
+        // y lo mueven los setters set_CurrentCredit() y set_Handpay().
+        case 0x1A:
+            responderContadorBCD(0x1A, (uint64_t)g_creditoActual * k);
+            break;
+
+        // ------------------------------------------------------------------
+        //  0x54 = que version de SAS hablo y cual es mi numero de serie.
+        //
+        //  Respuesta:  01 54 <largo> <3 ASCII version> <serie ASCII> <CRC16>
+        //  El <largo> cuenta version + serie, sin contar el CRC.
+        //
+        //  Los dos campos van en ASCII, NO en BCD.  Es de los pocos long
+        //  polls que mandan texto, asi que no se puede usar el codificador
+        //  BCD de los medidores.
+        // ------------------------------------------------------------------
+        case 0x54: {
+            uint8_t r[64];
+            uint16_t n = 0;
+
+            r[n++] = DIRECCION_SAS;
+            r[n++] = 0x54;
+            const uint16_t posLen = n;
+            r[n++] = 0x00;                       // se rellena al final
+
+            for (const char* p = SAS_VERSION_ASCII; *p && n < 60; ++p) r[n++] = (uint8_t)*p;
+            for (const char* p = SERIE_MAQUINA;     *p && n < 60; ++p) r[n++] = (uint8_t)*p;
+
+            r[posLen] = (uint8_t)(n - 3);
+
+            const uint16_t c = calcularCrc16Kermit(r, n);
+            r[n++] = (uint8_t)(c & 0xFF);
+            r[n++] = (uint8_t)((c >> 8) & 0xFF);
+            enviarTramaSas(r, n);
+            break;
+        }
+
+        // ------------------------------------------------------------------
+        //  0xA0 = que funciones tengo habilitadas.
+        //
+        //  Peticion:   01 A0 <juegoH> <juegoL> <CRC16>
+        //  Respuesta:  01 A0 <juegoH> <juegoL> <3 de features> <3 reservados> <CRC16>
+        //
+        //  Esta trama NO lleva byte de largo: es de tamano fijo, 12 bytes.
+        //
+        //  Los tres bytes de features van en CERO: son banderas de cosas que
+        //  esta placa no hace -AFT, bonos, torneos, validacion de tickets-.
+        //  Prender un bit aqui es prometerle al host algo que despues va a
+        //  pedir y no vamos a saber contestar.
+        // ------------------------------------------------------------------
+        case 0xA0: {
+            uint8_t r[16];
+            uint16_t n = 0;
+
+            r[n++] = DIRECCION_SAS;
+            r[n++] = 0xA0;
+
+            // Le devuelvo el mismo numero de juego que me pidio.  Si la
+            // trama venia corta, contesto el juego 0000, que es la maquina
+            // completa.
+            r[n++] = (largoTrama >= 4) ? trama[2] : 0x00;
+            r[n++] = (largoTrama >= 4) ? trama[3] : 0x00;
+
+            r[n++] = 0x00; r[n++] = 0x00; r[n++] = 0x00;   // features
+            r[n++] = 0x00; r[n++] = 0x00; r[n++] = 0x00;   // reservados
+
+            const uint16_t c = calcularCrc16Kermit(r, n);
+            r[n++] = (uint8_t)(c & 0xFF);
+            r[n++] = (uint8_t)((c >> 8) & 0xFF);
+            enviarTramaSas(r, n);
+            break;
+        }
+
+        // ------------------------------------------------------------------
+        //  MEDIDORES SUELTOS  (long polls 0x10 a 0x18)
+        //
+        //  Todos salen de obtenerValorMedidorRuta(), el MISMO puente que usa
+        //  el 0x2F.  Antes el 0x11 y el 0x12 leian data_-> por su cuenta y eso
+        //  daba dos caminos para el mismo dato: el dia que uno cambie, el
+        //  host recibe numeros distintos segun por donde pregunte, y no hay
+        //  forma de saber cual de los dos es el bueno.
+        //
+        //  Ojo con los codigos: el numero del LONG POLL y el numero del
+        //  MEDIDOR son dos numeraciones distintas.  El long poll 0x11 pide el
+        //  medidor 0x00, no el 0x11.
+        // ------------------------------------------------------------------
+
+        // 0x10 total cancelled credits -> medidor 0x04.  Es el cash out.
+        case 0x10: responderContadorBCD(0x10, medidorSas(0x04)); break;
+
+        // 0x11 total coin in -> medidor 0x00.  En SAS "coin in" es el total
+        // apostado, o sea el BET.
+        case 0x11: responderContadorBCD(0x11, medidorSas(0x00)); break;
+
+        // 0x12 total coin out: CERO, y es un cambio a proposito.
+        //
+        // Antes contestaba el HopperMeter, que es el mismo numero que el
+        // 0x10.  Eso es doble contabilidad: "coin out" es lo que la maquina
+        // PAGA por premios, y el cash out ya va reportado como creditos
+        // cancelados.  Un host que calcule neto = coin in - coin out -
+        // cancelados restaba el cash out dos veces.
+        //
+        // Esta placa no tiene de donde sacar los premios pagados, asi que va
+        // en cero, igual que en el 0x2F.
+        case 0x12: responderContadorBCD(0x12, 0); break;
+
+        // 0x13 total drop: cero.  No hay caja de caida en esta placa.
+        // PENDIENTE: si la jurisdiccion cuenta los billetes del stacker como
+        // drop, esto hay que revisarlo, porque entonces no es cero.
+        case 0x13: responderContadorBCD(0x13, 0); break;
+
+        // 0x14 total jackpot: cero de verdad.  Aqui no hay premios ni
+        // progresivos; el unico dinero que sale es el cash out, y ese ya va
+        // por el 0x10 y el 0x23.
+        case 0x14: responderContadorBCD(0x14, 0); break;
+
+        // Partidas jugadas / ganadas / perdidas.  La placa no tiene pulso de
+        // los que salgan, asi que van en cero.  Verificado en la maquina
+        // real: 0x15 = jugadas, 0x16 = ganadas, 0x17 = perdidas, y ademas
+        // 0x17 = 0x15 - 0x16 clavado (3594 - 776 = 2818).
+        case 0x15: responderContadorBCD(0x15, 0); break;
+        case 0x16: responderContadorBCD(0x16, 0); break;
+        case 0x17: responderContadorBCD(0x17, 0); break;
+
+        // 0x18 partidas desde el ultimo encendido y desde que se cerro la
+        // puerta.  Son DOS medidores de 2 BCD, no uno de 4, pero como los dos
+        // van en cero la trama sale igual de 8 bytes y el host la lee bien.
+        case 0x18: responderContadorBCD(0x18, 0); break;
+
+        // ------------------------------------------------------------------
+        //  BLOQUES DE VARIOS MEDIDORES  (0x0F y 0x19)
+        //
+        //  Son los mismos medidores de arriba pero en una sola trama.  El
+        //  orden lo fija la tabla 7.2a/7.2b y NO se puede cambiar: el host
+        //  cuenta posiciones, no lee codigos.
+        //
+        //  Salen del mismo puente que los sueltos, asi que no hay manera de
+        //  que el 0x0F y el 0x11 se contradigan.
+        // ------------------------------------------------------------------
+
+        // 0x0F: cancelados, coin in, coin out, drop, jackpot, jugadas.
+        case 0x0F: {
+            const uint64_t v[6] = {
+                medidorSas(0x04),   // total cancelled credits
+                medidorSas(0x00),   // total coin in  (= BET)
+                0,                  // total coin out  - sin fuente
+                0,                  // total drop      - no hay
+                0,                  // total jackpot   - no hay
+                0                   // games played    - sin fuente
+            };
+            responderBloqueMedidores(0x0F, v, 6);
+            break;
+        }
+
+        // 0x19: lo mismo sin los cancelados.
+        case 0x19: {
+            const uint64_t v[5] = {
+                medidorSas(0x00),   // total coin in  (= BET)
+                0,                  // total coin out
+                0,                  // total drop
+                0,                  // total jackpot
+                0                   // games played
+            };
+            responderBloqueMedidores(0x19, v, 5);
+            break;
+        }
+
+        // ------------------------------------------------------------------
+        //  0x46 = creditos de todos los billetes aceptados
+        //
+        //  Este SI lo tenemos de verdad y con la unidad correcta: la tabla
+        //  B-1 lo pide "in SAS accounting denom units", o sea en creditos,
+        //  que es exactamente lo que cuenta el billetero de esta placa.
+        //  Es el mismo dato del medidor 0x0B.
+        // ------------------------------------------------------------------
+        case 0x46: responderContadorBCD(0x46, medidorSas(0x0B)); break;
+
+        // ------------------------------------------------------------------
+        //  0x20 = valor en DOLARES de todos los billetes aceptados
+        //
+        //  Este lo tuve callado mientras no sabia la denominacion, porque
+        //  sin ella no hay forma de convertir creditos a dinero.  Ya la se:
+        //  un credito es un dolar, asi que el valor en dolares es el MISMO
+        //  numero que el 0x46 y no hay nada que multiplicar.
+        //
+        //  Ojo si algun dia la placa cambia de denominacion: aqui hay que
+        //  multiplicar por los dolares que valga un credito.  Hoy es x1 y
+        //  por eso no se ve la multiplicacion.
+        // ------------------------------------------------------------------
+        case 0x20: responderContadorBCD(0x20, medidorSas(0x0B)); break;
+
+        // 0x1B: ficha del hand pay trabado.  Si no hay ninguno sale en ceros.
+        case 0x1B:
+            responderHandpayInfo();
+            break;
+
+        // 0x1F: identidad de la maquina.
+        case 0x1F:
+            responderIdentidadMaquina();
+            break;
+
+        // ------------------------------------------------------------------
+        //  0x0A / 0x0B = entrar y salir de modo mantenimiento
+        //
+        //  Se contestan con un ACK de un byte.  Es honesto: el modo
+        //  mantenimiento solo sirve para que no suene la alarma de puerta
+        //  abierta mientras el tecnico trabaja, y esta placa no tiene alarma
+        //  de puerta, o sea que no hay nada que hacer y nada que prometer.
+        //  Guardo la bandera nada mas para verla en el debugger.
+        // ------------------------------------------------------------------
+        case 0x0A:
+            g_modoMantenimiento = true;
+            responderAckSimple();
+            break;
+        case 0x0B:
+            g_modoMantenimiento = false;
+            responderAckSimple();
+            break;
+
+        // ------------------------------------------------------------------
+        //  0x94 = reset remoto del hand pay
+        //
+        //  El host nos dice que ya pago y que soltemos el bloqueo.  Se borra
+        //  la ficha del 0x1B y se avisa con la excepcion 0x52.
+        //
+        //  LIMITACION CONOCIDA: la trama trae un byte de codigo -00 reset
+        //  normal, 01 devolver el hand pay al medidor de creditos- que aqui
+        //  no llega a leerse, porque el ensamblador cierra estos long polls
+        //  en direccion + comando.  Cualquier 0x94 se trata como reset
+        //  normal.  Para esta placa da igual: no sabemos devolver creditos.
+        // ------------------------------------------------------------------
+        case 0x94:
+            g_handpayPendiente = false;
+            g_handpayMonto     = 0;
+            encolarExcepcionSas(SAS_EXC_HANDPAY_RESETEADO);
+            responderAckSimple();
+            break;
+
+        // ------------------------------------------------------------------
+        //  LO QUE NO SE CONTESTA A PROPOSITO
+        //
+        //  En SAS callar es una respuesta valida; inventar una trama no.  La
+        //  tabla 7.1b lo dice claro: un medidor que uno SABE que vale cero se
+        //  contesta con cero, pero un medidor que uno simplemente no puede
+        //  medir se tiene que IGNORAR.  Contestar cero ahi es afirmar algo
+        //  que no nos consta.
+        //
+        //    0x1E  billetes por denominacion.  Este sigue callado aunque ya
+        //          sepa la denominacion de la MAQUINA, porque son dos cosas
+        //          distintas: yo se que un credito vale un dolar, pero no se
+        //          si los veinte creditos que acaban de entrar fueron un
+        //          billete de veinte o veinte billetes de uno.  La placa
+        //          cuenta pulsos, no billetes.
+        //
+        //          Contestar seis ceros mientras el 0x0B trae miles de
+        //          creditos es contradecirse solo, y en una auditoria eso se
+        //          lee como maquina manipulada.
+        //
+        //    0x2D  cancelados por numero de juego.  Habria que leer el juego
+        //          que viene en la peticion, y el ensamblador cierra este
+        //          long poll antes de esos bytes.
+        //
+        //    0x01..0x07  apagar/encender la maquina, el sonido y el
+        //          billetero.  Esta placa LEE pulsos, no manda nada a la
+        //          maquina.  Contestar ACK aqui seria decirle al host
+        //          "listo, ya deshabilite el billetero" mientras el billetero
+        //          sigue tragando dinero.  Eso es peor que no contestar.
+        //
+        //    0x73  registro de AFT.  El host no lo usa: manda la llave de
+        //          registro en ceros dentro del 0x72, que significa "no hace
+        //          falta registrarse".
+        // ------------------------------------------------------------------
+
+        // ------------------------------------------------------------------
+        //  AFT.  Aqui empieza el cash out remoto de verdad.
+        //
+        //  Antes los dejaba callados a proposito, con el argumento de que
+        //  contestarlos le prometia al host una capacidad inexistente.  El
+        //  argumento era bueno y la conclusion estaba mal: el host NO usa
+        //  JSON para el cash out remoto, usa AFT.  Callarse no era prudencia,
+        //  era dejar el cash out sin disparador.
+        // ------------------------------------------------------------------
+        case 0x74:
+            responderAftLockStatus(trama, largoTrama);
+            break;
+
+        case 0x72:
+            responderAftTransfer(trama, largoTrama);
+            break;
+
+        default:
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  ATENCION DEL BUS  -  se llama en cada vuelta del lazo
+// ---------------------------------------------------------------------------
+void SasEgm::atenderSas() {
+    uint32_t edadMs = 0;
+    uint16_t n      = 0;
+
+    // Se vacia la cola hasta dar con una trama FRESCA.  Si nos atrasamos, las
+    // viejas se tiran: contestar tarde es peor que no contestar, porque la
+    // respuesta se le cruza al host con su siguiente poleo y le rompe la
+    // trama buena.
+    while ((n = rx_.readFrame(bufferRecepcionSas_,
+                                sizeof(bufferRecepcionSas_), &edadMs)) > 0) {
+        if (edadMs <= SAS_EDAD_MAXIMA_MS) break;
+    }
+    if (n == 0) return;
+
+    // Llego algo: el enlace esta vivo.  Si venia caido, el host acaba de
+    // volver y no hay nada que hacer para retomar: la placa contesta lo que
+    // le pregunten, como siempre.  Solo se anota para el diagnostico.
+    g_msUltimaTrama = HAL_GetTick();
+    g_enlaceArriba  = true;
+
+    // --- POLEO GENERAL: un solo byte ---------------------------------------
+    if (n == 1) {
+        const uint8_t direccion = bufferRecepcionSas_[0];
+
+        if (direccion == (uint8_t)(DIRECCION_SAS | 0x80)) {
+            // Es para nosotros.
+            uint8_t excepcion = 0x00;     // 0x00 = sin novedad
+
+            if (EXCEPCIONES_SAS_ACTIVO) {
+                if (g_excEnVuelo) {
+                    // El host REPITIO el mismo poleo general sin haber
+                    // acusado la excepcion anterior.  Eso es un NACK
+                    // implicito -SAS 6.02 seccion 3.2-: no la recibio bien.
+                    // Se manda LA MISMA otra vez.
+                    //
+                    // Si en vez de esto se borrara al transmitir, el
+                    // reintento del host contestaria 0x00 y el evento se
+                    // perderia para siempre.  Un hand pay perdido es dinero
+                    // que el sistema nunca se entero que salio.
+                    excepcion = g_excEnVueloCodigo;
+                    sasNackImplicitos_++;
+                }
+                else if (g_excPendiente != 0x00) {
+                    excepcion          = g_excPendiente;
+                    g_excEnVuelo       = true;
+                    g_excEnVueloCodigo = g_excPendiente;
+                    g_excPendiente     = 0x00;
+                }
+            }
+
+            rx_.write(&excepcion, 1);
+            sasPoleosContestados_++;
+            return;
+        }
+
+        // Poleo general dirigido a OTRA maquina del bus.  No se contesta,
+        // pero segun la tabla 3.1 cuenta como acuse de recibo de nuestra
+        // excepcion: el host siguio adelante con su ronda, o sea que la
+        // recibio bien.
+        if ((direccion & 0x80) && EXCEPCIONES_SAS_ACTIVO) {
+            g_excEnVuelo = false;
+        }
+        return;
+    }
+
+    // --- LONG POLL ---------------------------------------------------------
+    //
+    // Un long poll dirigido a nosotros tambien acusa recibo de la excepcion
+    // -tabla 3.1-.  Se marca ANTES de contestar, porque la respuesta al long
+    // poll puede levantar una excepcion nueva y esa no debe darse por
+    // entregada de una vez.
+    if (EXCEPCIONES_SAS_ACTIVO) {
+        g_excEnVuelo = false;
+    }
+
+    ProcesarComandoSAS(bufferRecepcionSas_, n);
+}
+
+// ---------------------------------------------------------------------------
+//  REEMISION DE LA EXCEPCION 0x51
+//
+//  Seccion 7.8.1 del SAS 6.02: si el host no viene por el 0x1B dentro de los
+//  quince segundos siguientes al aviso, hay que repetirlo, y seguir
+//  repitiendolo cada quince segundos mientras el hand pay siga pendiente.
+//
+//  El reloj se reinicia cada vez que se encola la excepcion, asi que la
+//  primera reemision cae quince segundos despues del aviso original y no
+//  quince segundos despues del arranque.
+//
+//  Ojo con la diferencia entre las dos banderas: g_excPendiente es "hay algo
+//  que mandar en el proximo poleo" y g_excEnVuelo es "ya lo mande pero el
+//  host no lo ha acusado".  Solo reemito cuando las DOS estan en falso, o
+//  sea cuando el aviso ya se dio por entregado y aun asi el host nunca vino
+//  a preguntar.  Reemitir con una en vuelo seria pisar el reintento que ya
+//  maneja atenderSas().
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+//  VIGILANCIA DEL ENLACE
+//
+//  Corre en cada vuelta del lazo: se da cuenta de que el host se fue y
+//  limpia lo que quedo a medias.
+//
+//  La placa NUNCA habla sola.  El bus SAS es multipunto y un EGM que
+//  transmite sin que le pregunten se atraviesa con la respuesta de otro.
+// ---------------------------------------------------------------------------
+bool SasEgm::enlaceArriba() const {
+    return g_enlaceArriba;
+}
+
+
+void SasEgm::vigilarEnlace() {
+    const uint32_t ahora = HAL_GetTick();
+
+    // --- se cayo? ------------------------------------------------------
+    if (g_enlaceArriba && (ahora - g_msUltimaTrama) >= ENLACE_TIMEOUT_MS) {
+        g_enlaceArriba = false;
+        g_caidasEnlace++;
+
+        // Limpieza de lo que quedo a medias.  Esto NO depende de ninguna
+        // bandera: es correccion, no una funcion opcional.
+        //
+        //   - el bloqueo de AFT se suelta.  Lo pide el manual: una maquina
+        //     que entra en link down estando bloqueada tiene que volver a
+        //     "no locked".  Si no, queda muerta esperando a un host que ya
+        //     no esta.
+        //   - la excepcion "en vuelo" se tira.  Esa conversacion se murio
+        //     con el host viejo; reenviarsela al que vuelva seria contarle
+        //     el final de una historia que nunca escucho.
+        //
+        // Lo que SI se conserva es g_excPendiente: si hubo un hand pay
+        // mientras el host no estaba, se le cuenta en cuanto vuelva.
+        liberarBloqueoAft();
+        g_excEnVuelo = false;
+    }
+}
+
+void SasEgm::reemitirExcepcionHandpay() {
+    if (!EXCEPCIONES_SAS_ACTIVO) return;
+    if (!g_handpayPendiente)     return;
+    if (g_excPendiente != 0x00 || g_excEnVuelo) return;
+
+    if ((HAL_GetTick() - g_msUltimaExc51) < SAS_REEMITIR_51_MS) return;
+
+    encolarExcepcionSas(SAS_EXC_HANDPAY_PENDIENTE);
+}

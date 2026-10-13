@@ -1,0 +1,12 @@
+../Core/JSON/CrearJson.cpp:11:1:CrearJson::CrearJson()	16	static
+../Core/JSON/CrearJson.cpp:25:13:bool ExtraerEnteroJSON(const char*, const char*, int&)	40	static
+../Core/JSON/CrearJson.cpp:47:6:void CrearJson::ConstruirJson(JsonData, char*)	32	static
+../Core/JSON/CrearJson.cpp:123:6:void CrearJson::JSON_Evento_INSTANTANEO(const JsonData&, int, char*)	32	static
+../Core/JSON/CrearJson.cpp:164:5:int CrearJson::mes_a_numero(const char*)	16	static
+../Core/JSON/CrearJson.cpp:181:5:int CrearJson::obtener_fecha_compilacion()	40	static
+../Core/JSON/CrearJson.cpp:199:5:int CrearJson::obtener_hora_compilacion()	40	static
+../Core/JSON/CrearJson.cpp:208:5:int CrearJson::Recibe_JSON(uint8_t*)	40	static
+../Core/JSON/CrearJson.cpp:255:5:int CrearJson::Decodifica_Solicitud_Cash_In(uint8_t*, int&, int&)	32	static
+../Core/JSON/CrearJson.cpp:284:6:void CrearJson::JSON_Eve_Error(uint32_t&, char*, char)	32	static
+../Core/JSON/CrearJson.cpp:309:6:void CrearJson::JSON_Eve_ON(uint32_t&, char*)	32	static
+../Core/JSON/CrearJson.cpp:321:6:void CrearJson::crear_version_fw(char*, size_t)	48	static
